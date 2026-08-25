@@ -127,6 +127,37 @@ impl SynoraNode {
         self.chain.state_mut().create_account(address, balance);
     }
 
+    /// Find a transaction in the mempool or confirmed blocks.
+    ///
+    /// Returns:
+    /// - `Some((None, tx))` when the transaction is pending.
+    /// - `Some((Some(height), tx))` when the transaction is confirmed.
+    /// - `None` when the transaction does not exist.
+    pub fn find_transaction(
+        &self,
+        hash: &synora_core::hash::Hash,
+    ) -> Option<(Option<u64>, &Transaction)> {
+        if let Some(transaction) = self.mempool.get(hash) {
+            return Some((None, transaction));
+        }
+
+        for height in 1..=self.chain.height() {
+            let Some(block) = self.chain.block(height) else {
+                continue;
+            };
+
+            if let Some(transaction) = block
+                .transactions
+                .iter()
+                .find(|transaction| transaction.hash() == *hash)
+            {
+                return Some((Some(height), transaction));
+            }
+        }
+
+        None
+    }
+
     fn select_block_transactions(&self) -> Vec<Transaction> {
         let gas_limit = self.config.block_gas_limit;
 
@@ -162,32 +193,59 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synora_core::crypto::Keypair;
 
-    fn transaction(sender: Address, recipient: Address, nonce: u64, gas_limit: u64) -> Transaction {
-        Transaction::new(
-            1337,
+    struct TestAccount {
+        keypair: Keypair,
+        address: Address,
+    }
+
+    impl TestAccount {
+        fn new(seed: u8) -> Self {
+            let keypair = Keypair::from_bytes(&[seed; 32]);
+
+            let address = keypair.address();
+
+            Self { keypair, address }
+        }
+    }
+
+    fn transaction(
+        chain_id: u64,
+        keypair: &Keypair,
+        recipient: Address,
+        nonce: u64,
+        gas_limit: u64,
+    ) -> Transaction {
+        let mut tx = Transaction::new(
+            chain_id,
             nonce,
-            sender,
+            keypair.address(),
             recipient,
             1_000,
             gas_limit,
             1,
             Vec::new(),
-        )
+        );
+
+        tx.sign(keypair)
+            .expect("test transaction should be signable");
+
+        tx
     }
 
-    fn setup_node(block_gas_limit: u64) -> (SynoraNode, Address, Address, Address) {
+    fn setup_node(block_gas_limit: u64) -> (SynoraNode, TestAccount, TestAccount, Address) {
         let config = NodeConfig::new(1337, [0xFE; 20], 100, block_gas_limit);
 
         let mut node = SynoraNode::new(config, 1_700_000_000);
 
-        let alice = [1u8; 20];
-        let carol = [3u8; 20];
+        let alice = TestAccount::new(1);
+        let carol = TestAccount::new(3);
         let bob = [2u8; 20];
         let fee_recipient = [0xFE; 20];
 
-        node.create_account(alice, 1_000_000);
-        node.create_account(carol, 1_000_000);
+        node.create_account(alice.address, 1_000_000);
+        node.create_account(carol.address, 1_000_000);
         node.create_account(bob, 0);
         node.create_account(fee_recipient, 0);
 
@@ -209,7 +267,7 @@ mod tests {
     fn transaction_can_be_submitted() {
         let (mut node, alice, _, bob) = setup_node(1_000_000);
 
-        node.submit_transaction(transaction(alice, bob, 0, 21_000))
+        node.submit_transaction(transaction(1337, &alice.keypair, bob, 0, 21_000))
             .expect("transaction should enter mempool");
 
         assert_eq!(node.pending_transactions(), 1);
@@ -219,7 +277,7 @@ mod tests {
     fn block_can_be_produced_from_mempool() {
         let (mut node, alice, _, bob) = setup_node(1_000_000);
 
-        node.submit_transaction(transaction(alice, bob, 0, 21_000))
+        node.submit_transaction(transaction(1337, &alice.keypair, bob, 0, 21_000))
             .expect("transaction should enter mempool");
 
         let block = node
@@ -230,8 +288,13 @@ mod tests {
         assert_eq!(block.transaction_count(), 1);
         assert_eq!(node.pending_transactions(), 0);
 
-        assert_eq!(node.state().get_account(&alice).unwrap().balance, 978_000);
-        assert_eq!(node.state().get_account(&alice).unwrap().nonce, 1);
+        assert_eq!(
+            node.state().get_account(&alice.address).unwrap().balance,
+            978_000
+        );
+
+        assert_eq!(node.state().get_account(&alice.address).unwrap().nonce, 1);
+
         assert_eq!(node.state().get_account(&bob).unwrap().balance, 1_000);
 
         assert_eq!(
@@ -249,10 +312,10 @@ mod tests {
          * requires each sender's transaction nonce to equal its
          * current state nonce.
          */
-        node.submit_transaction(transaction(alice, bob, 0, 21_000))
+        node.submit_transaction(transaction(1337, &alice.keypair, bob, 0, 21_000))
             .expect("Alice transaction should enter mempool");
 
-        node.submit_transaction(transaction(carol, bob, 0, 21_000))
+        node.submit_transaction(transaction(1337, &carol.keypair, bob, 0, 21_000))
             .expect("Carol transaction should enter mempool");
 
         let block = node
@@ -269,10 +332,10 @@ mod tests {
     fn transaction_that_does_not_fit_stays_in_mempool() {
         let (mut node, alice, carol, bob) = setup_node(21_000);
 
-        node.submit_transaction(transaction(alice, bob, 0, 21_000))
+        node.submit_transaction(transaction(1337, &alice.keypair, bob, 0, 21_000))
             .expect("Alice transaction should enter mempool");
 
-        node.submit_transaction(transaction(carol, bob, 0, 21_000))
+        node.submit_transaction(transaction(1337, &carol.keypair, bob, 0, 21_000))
             .expect("Carol transaction should enter mempool");
 
         let block = node
@@ -287,7 +350,7 @@ mod tests {
     fn oversized_transaction_is_not_selected() {
         let (mut node, alice, _, bob) = setup_node(20_000);
 
-        node.submit_transaction(transaction(alice, bob, 0, 21_000))
+        node.submit_transaction(transaction(1337, &alice.keypair, bob, 0, 21_000))
             .expect("transaction should enter mempool");
 
         let result = node.produce_block(Some(1_700_000_100));

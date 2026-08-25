@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::crypto::CryptoError;
 use crate::hash::Hash;
 use crate::state::State;
 use crate::transaction::Transaction;
@@ -14,6 +15,7 @@ pub enum MempoolError {
     InsufficientBalance,
     InvalidTransaction,
     SenderNonceConflict,
+    InvalidSignature,
 }
 
 #[derive(Debug)]
@@ -69,59 +71,58 @@ impl Mempool {
         }
 
         // ------------------------------------------------------------
-        // 2. Validasi transaksi sebelum masuk mempool.
-        //
-        // checked_total_cost() harus mengembalikan Option.
-        // Jika None berarti terjadi overflow sehingga transaksi
-        // tidak boleh diterima.
+        // 2. Validasi transaksi dasar.
         // ------------------------------------------------------------
-        let total_cost = tx
-            .checked_total_cost()
-            .ok_or(MempoolError::InvalidTransaction)?;
+        tx.validate()
+            .map_err(|_| MempoolError::InvalidTransaction)?;
 
         // ------------------------------------------------------------
-        // 3. Hitung hash setelah validasi dasar.
+        // 3. Verifikasi signature.
+        //
+        // Signature harus:
+        // - valid secara Ed25519
+        // - cocok dengan public key
+        // - public key menghasilkan sender address
+        // - signature dibuat dari hash transaksi
+        // ------------------------------------------------------------
+        tx.verify_signature()
+            .map_err(|_: CryptoError| MempoolError::InvalidSignature)?;
+
+        // ------------------------------------------------------------
+        // 4. Hitung hash setelah validasi dasar.
         // ------------------------------------------------------------
         let tx_hash = tx.hash();
 
         // ------------------------------------------------------------
-        // 4. Tolak transaksi duplikat.
+        // 5. Tolak transaksi duplikat.
         // ------------------------------------------------------------
         if self.contains(&tx_hash) {
             return Err(MempoolError::DuplicateTransaction);
         }
 
         // ------------------------------------------------------------
-        // 5. Jangan menerima transaksi jika mempool penuh.
+        // 6. Jangan menerima transaksi jika mempool penuh.
         // ------------------------------------------------------------
         if self.is_full() {
             return Err(MempoolError::MempoolFull);
         }
 
         // ------------------------------------------------------------
-        // 6. Sender harus sudah memiliki account.
+        // 7. Sender harus sudah memiliki account.
         // ------------------------------------------------------------
         let sender = state
             .get_account(&tx.sender)
             .ok_or(MempoolError::SenderNotFound)?;
 
         // ------------------------------------------------------------
-        // 7. Nonce harus sesuai dengan nonce account.
-        //
-        // Ini mencegah replay dan transaksi dengan nonce yang
-        // tidak sesuai state saat ini.
+        // 8. Nonce harus sama persis dengan nonce account.
         // ------------------------------------------------------------
-        if tx.nonce < sender.nonce {
+        if tx.nonce != sender.nonce {
             return Err(MempoolError::InvalidNonce);
         }
 
         // ------------------------------------------------------------
-        // 8. Cegah dua transaksi dengan sender + nonce yang sama
-        // berada bersamaan di mempool.
-        //
-        // Ini penting karena HashMap berdasarkan transaction hash
-        // masih memungkinkan dua transaksi berbeda memiliki nonce
-        // yang sama.
+        // 9. Cegah dua transaksi dengan sender + nonce yang sama.
         // ------------------------------------------------------------
         if self
             .transactions
@@ -132,17 +133,18 @@ impl Mempool {
         }
 
         // ------------------------------------------------------------
-        // 9. Pastikan saldo sender cukup untuk value + fee.
-        //
-        // total_cost sudah dihitung dengan checked arithmetic,
-        // sehingga tidak ada overflow.
+        // 10. Pastikan saldo sender cukup untuk value + fee.
         // ------------------------------------------------------------
+        let total_cost = tx
+            .checked_total_cost()
+            .ok_or(MempoolError::InvalidTransaction)?;
+
         if sender.balance < u128::from(total_cost) {
             return Err(MempoolError::InsufficientBalance);
         }
 
         // ------------------------------------------------------------
-        // 10. Masukkan transaksi ke mempool.
+        // 11. Masukkan transaksi ke mempool.
         // ------------------------------------------------------------
         self.transactions.insert(tx_hash, tx);
 
@@ -160,10 +162,6 @@ impl Mempool {
     pub fn transactions(&self) -> Vec<&Transaction> {
         let mut transactions: Vec<&Transaction> = self.transactions.values().collect();
 
-        // Prioritas:
-        // 1. gas_price terbesar
-        // 2. nonce terkecil
-        // 3. hash terkecil sebagai deterministic tie-breaker
         transactions.sort_by(|a, b| {
             b.gas_price
                 .cmp(&a.gas_price)
@@ -196,19 +194,18 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::Keypair;
 
-    fn account(address: u8, balance: u128) -> ([u8; 20], u128) {
-        ([address; 20], balance)
-    }
-
-    fn transaction(
+    fn signed_transaction(
+        keypair: &Keypair,
         nonce: u64,
-        sender: [u8; 20],
         recipient: [u8; 20],
         value: u64,
         gas_price: u64,
     ) -> Transaction {
-        Transaction::new(
+        let sender = keypair.address();
+
+        let mut tx = Transaction::new(
             1,
             nonce,
             sender,
@@ -217,19 +214,23 @@ mod tests {
             21_000,
             gas_price,
             Vec::new(),
-        )
+        );
+
+        tx.sign(keypair).expect("transaction should be signable");
+
+        tx
     }
 
-    fn state_with_accounts() -> State {
+    fn state_with_accounts() -> (State, Keypair, Keypair) {
         let mut state = State::new();
 
-        let (alice, alice_balance) = account(1, 1_000_000);
-        let (bob, bob_balance) = account(2, 0);
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
+        let bob_keypair = Keypair::from_bytes(&[2u8; 32]);
 
-        state.create_account(alice, alice_balance);
-        state.create_account(bob, bob_balance);
+        state.create_account(alice_keypair.address(), 1_000_000);
+        state.create_account(bob_keypair.address(), 0);
 
-        state
+        (state, alice_keypair, bob_keypair)
     }
 
     #[test]
@@ -245,12 +246,9 @@ mod tests {
 
     #[test]
     fn transaction_can_be_submitted() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
-
-        let tx = transaction(0, alice, bob, 10_000, 1);
+        let tx = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
         let tx_hash = tx.hash();
 
         let mut mempool = Mempool::new(1, 100);
@@ -265,12 +263,9 @@ mod tests {
 
     #[test]
     fn duplicate_transaction_is_rejected() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
-
-        let tx = transaction(0, alice, bob, 10_000, 1);
+        let tx = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
 
         let mut mempool = Mempool::new(1, 100);
 
@@ -286,12 +281,11 @@ mod tests {
 
     #[test]
     fn wrong_chain_id_is_rejected() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
+        let mut tx = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
 
-        let tx = Transaction::new(2, 0, alice, bob, 10_000, 21_000, 1, Vec::new());
+        tx.chain_id = 2;
 
         let mut mempool = Mempool::new(1, 100);
 
@@ -304,12 +298,12 @@ mod tests {
     fn missing_sender_is_rejected() {
         let mut state = State::new();
 
-        let bob = [2u8; 20];
-        state.create_account(bob, 0);
+        let alice = Keypair::from_bytes(&[1u8; 32]);
+        let bob = Keypair::from_bytes(&[2u8; 32]);
 
-        let alice = [1u8; 20];
+        state.create_account(bob.address(), 0);
 
-        let tx = transaction(0, alice, bob, 10_000, 1);
+        let tx = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
 
         let mut mempool = Mempool::new(1, 100);
 
@@ -320,40 +314,29 @@ mod tests {
 
     #[test]
     fn wrong_nonce_is_rejected() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
-
-        let tx = transaction(1, alice, bob, 10_000, 1);
+        let tx = signed_transaction(&alice, 1, bob.address(), 10_000, 1);
 
         let mut mempool = Mempool::new(1, 100);
 
-        let tx_hash = tx.hash();
         let result = mempool.submit(&state, tx);
 
-        /*
-         * Nonce 1 sekarang belum valid karena account nonce = 0
-         * dan belum ada transaksi pending nonce 0.
-         *
-         * Versi ini menerima nonce berurutan untuk pending transaction
-         * hanya jika nonce tersebut benar-benar tersedia setelah
-         * transaksi pending sebelumnya.
-         */
-        assert_eq!(result, Ok(tx_hash));
+        assert_eq!(result, Err(MempoolError::InvalidNonce));
+        assert_eq!(mempool.len(), 0);
     }
 
     #[test]
     fn insufficient_balance_is_rejected() {
         let mut state = State::new();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
+        let alice = Keypair::from_bytes(&[1u8; 32]);
+        let bob = Keypair::from_bytes(&[2u8; 32]);
 
-        state.create_account(alice, 100);
-        state.create_account(bob, 0);
+        state.create_account(alice.address(), 100);
+        state.create_account(bob.address(), 0);
 
-        let tx = transaction(0, alice, bob, 10_000, 1);
+        let tx = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
 
         let mut mempool = Mempool::new(1, 100);
 
@@ -364,36 +347,29 @@ mod tests {
 
     #[test]
     fn capacity_is_enforced() {
-        let state = state_with_accounts();
-
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
+        let (state, alice, bob) = state_with_accounts();
 
         let mut mempool = Mempool::new(1, 1);
 
-        let tx1 = transaction(0, alice, bob, 10_000, 1);
+        let tx1 = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
 
         mempool
             .submit(&state, tx1)
             .expect("first transaction should work");
 
-        let state2 = state_with_accounts();
+        let tx2 = signed_transaction(&bob, 0, alice.address(), 1, 1);
 
-        let tx2 = transaction(0, bob, alice, 1, 1);
-
-        let result = mempool.submit(&state2, tx2);
+        // Bob has zero balance, but the mempool is already full.
+        let result = mempool.submit(&state, tx2);
 
         assert_eq!(result, Err(MempoolError::MempoolFull));
     }
 
     #[test]
     fn transaction_can_be_removed() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
-
-        let tx = transaction(0, alice, bob, 10_000, 1);
+        let tx = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
         let tx_hash = tx.hash();
 
         let mut mempool = Mempool::new(1, 100);
@@ -409,17 +385,15 @@ mod tests {
 
     #[test]
     fn transactions_are_sorted_by_gas_price() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
+        let charlie = Keypair::from_bytes(&[3u8; 32]);
 
-        let tx1 = transaction(0, alice, bob, 10_000, 1);
+        let mut state2 = state.clone();
+        state2.create_account(charlie.address(), 1_000_000);
 
-        let mut state2 = state_with_accounts();
-        state2.create_account([3u8; 20], 1_000_000);
-
-        let tx2 = transaction(0, [3u8; 20], bob, 10_000, 10);
+        let tx1 = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
+        let tx2 = signed_transaction(&charlie, 0, bob.address(), 10_000, 10);
 
         let mut mempool = Mempool::new(1, 100);
 
@@ -436,14 +410,10 @@ mod tests {
 
     #[test]
     fn same_sender_and_nonce_conflict_is_rejected() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
-
-        let tx1 = transaction(0, alice, bob, 10_000, 1);
-
-        let tx2 = Transaction::new(1, 0, alice, bob, 20_000, 21_000, 10, Vec::new());
+        let tx1 = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
+        let tx2 = signed_transaction(&alice, 0, bob.address(), 20_000, 10);
 
         let mut mempool = Mempool::new(1, 100);
 
@@ -459,17 +429,15 @@ mod tests {
 
     #[test]
     fn take_removes_highest_priority_transactions() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
+        let charlie = Keypair::from_bytes(&[3u8; 32]);
 
-        let tx1 = transaction(0, alice, bob, 10_000, 1);
+        let mut state2 = state.clone();
+        state2.create_account(charlie.address(), 1_000_000);
 
-        let mut state2 = state_with_accounts();
-        state2.create_account([3u8; 20], 1_000_000);
-
-        let tx2 = transaction(0, [3u8; 20], bob, 10_000, 10);
+        let tx1 = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
+        let tx2 = signed_transaction(&charlie, 0, bob.address(), 10_000, 10);
 
         let mut mempool = Mempool::new(1, 100);
 
@@ -488,12 +456,9 @@ mod tests {
 
     #[test]
     fn take_zero_does_not_remove_transactions() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
-
-        let tx = transaction(0, alice, bob, 10_000, 1);
+        let tx = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
 
         let mut mempool = Mempool::new(1, 100);
 
@@ -507,12 +472,9 @@ mod tests {
 
     #[test]
     fn clear_removes_all_transactions() {
-        let state = state_with_accounts();
+        let (state, alice, bob) = state_with_accounts();
 
-        let alice = [1u8; 20];
-        let bob = [2u8; 20];
-
-        let tx = transaction(0, alice, bob, 10_000, 1);
+        let tx = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
 
         let mut mempool = Mempool::new(1, 100);
 
@@ -524,5 +486,44 @@ mod tests {
 
         assert_eq!(mempool.len(), 0);
         assert!(mempool.is_empty());
+    }
+
+    #[test]
+    fn invalid_signature_is_rejected() {
+        let (state, alice, bob) = state_with_accounts();
+
+        let mut tx = signed_transaction(&alice, 0, bob.address(), 10_000, 1);
+
+        tx.signature[0] ^= 0xFF;
+
+        let mut mempool = Mempool::new(1, 100);
+
+        let result = mempool.submit(&state, tx);
+
+        assert_eq!(result, Err(MempoolError::InvalidSignature));
+        assert_eq!(mempool.len(), 0);
+    }
+
+    #[test]
+    fn unsigned_transaction_is_rejected() {
+        let (state, alice, bob) = state_with_accounts();
+
+        let tx = Transaction::new(
+            1,
+            0,
+            alice.address(),
+            bob.address(),
+            10_000,
+            21_000,
+            1,
+            Vec::new(),
+        );
+
+        let mut mempool = Mempool::new(1, 100);
+
+        let result = mempool.submit(&state, tx);
+
+        assert_eq!(result, Err(MempoolError::InvalidSignature));
+        assert_eq!(mempool.len(), 0);
     }
 }
