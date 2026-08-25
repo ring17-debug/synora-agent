@@ -1,0 +1,375 @@
+use std::collections::HashMap;
+
+use crate::hash::{Hash, hash, hash_pair, zero_hash};
+
+pub type Address = [u8; 20];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub balance: u128,
+    pub nonce: u64,
+}
+
+impl Account {
+    pub fn new(balance: u128) -> Self {
+        Self { balance, nonce: 0 }
+    }
+
+    pub fn hash(&self, address: &Address) -> Hash {
+        let mut bytes = Vec::with_capacity(20 + 16 + 8);
+
+        bytes.extend_from_slice(address);
+        bytes.extend_from_slice(&self.balance.to_le_bytes());
+        bytes.extend_from_slice(&self.nonce.to_le_bytes());
+
+        hash(&bytes)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct State {
+    accounts: HashMap<Address, Account>,
+}
+
+impl State {
+    pub fn new() -> Self {
+        Self {
+            accounts: HashMap::new(),
+        }
+    }
+
+    pub fn create_account(&mut self, address: Address, balance: u128) {
+        self.accounts.insert(address, Account::new(balance));
+    }
+
+    pub fn get_account(&self, address: &Address) -> Option<&Account> {
+        self.accounts.get(address)
+    }
+
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+
+    pub fn transfer(
+        &mut self,
+        from: Address,
+        to: Address,
+        amount: u128,
+    ) -> Result<(), &'static str> {
+        self.transfer_internal(from, to, amount, true)
+    }
+
+    pub(crate) fn transfer_without_nonce(
+        &mut self,
+        from: Address,
+        to: Address,
+        amount: u128,
+    ) -> Result<(), &'static str> {
+        self.transfer_internal(from, to, amount, false)
+    }
+
+    fn transfer_internal(
+        &mut self,
+        from: Address,
+        to: Address,
+        amount: u128,
+        increment_nonce: bool,
+    ) -> Result<(), &'static str> {
+        let sender_balance = self.accounts.get(&from).ok_or("sender not found")?.balance;
+
+        let receiver_balance = self.accounts.get(&to).ok_or("receiver not found")?.balance;
+
+        if sender_balance < amount {
+            return Err("insufficient balance");
+        }
+
+        let new_sender_balance = sender_balance - amount;
+
+        let new_receiver_balance = if from == to {
+            receiver_balance
+        } else {
+            receiver_balance
+                .checked_add(amount)
+                .ok_or("balance overflow")?
+        };
+
+        let new_nonce = if increment_nonce {
+            self.accounts
+                .get(&from)
+                .ok_or("sender not found")?
+                .nonce
+                .checked_add(1)
+                .ok_or("nonce overflow")?
+        } else {
+            self.accounts.get(&from).ok_or("sender not found")?.nonce
+        };
+
+        {
+            let sender = self.accounts.get_mut(&from).ok_or("sender not found")?;
+
+            sender.balance = new_sender_balance;
+
+            if increment_nonce {
+                sender.nonce = new_nonce;
+            }
+        }
+
+        if from != to {
+            let receiver = self.accounts.get_mut(&to).ok_or("receiver not found")?;
+
+            receiver.balance = new_receiver_balance;
+        }
+
+        Ok(())
+    }
+
+    pub fn burn(&mut self, address: Address, amount: u128) -> Result<(), &'static str> {
+        let account = self.accounts.get(&address).ok_or("account not found")?;
+
+        if account.balance < amount {
+            return Err("insufficient balance");
+        }
+
+        let new_balance = account
+            .balance
+            .checked_sub(amount)
+            .ok_or("insufficient balance")?;
+
+        let new_nonce = account.nonce.checked_add(1).ok_or("nonce overflow")?;
+
+        let account = self.accounts.get_mut(&address).ok_or("account not found")?;
+
+        account.balance = new_balance;
+        account.nonce = new_nonce;
+
+        Ok(())
+    }
+
+    pub fn state_root(&self) -> Hash {
+        if self.accounts.is_empty() {
+            return zero_hash();
+        }
+
+        let mut entries: Vec<(&Address, &Account)> = self.accounts.iter().collect();
+
+        entries.sort_by_key(|(address, _)| *address);
+
+        let mut hashes: Vec<Hash> = entries
+            .iter()
+            .map(|(address, account)| account.hash(address))
+            .collect();
+
+        while hashes.len() > 1 {
+            let mut next = Vec::with_capacity(hashes.len().div_ceil(2));
+
+            for pair in hashes.chunks(2) {
+                let left = pair[0];
+                let right = if pair.len() == 2 { pair[1] } else { pair[0] };
+
+                next.push(hash_pair(&left, &right));
+            }
+
+            hashes = next;
+        }
+
+        hashes[0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_can_be_created() {
+        let address = [1u8; 20];
+
+        let mut state = State::new();
+
+        state.create_account(address, 1_000);
+
+        let account = state.get_account(&address).expect("account should exist");
+
+        assert_eq!(account.balance, 1_000);
+        assert_eq!(account.nonce, 0);
+        assert_eq!(state.account_count(), 1);
+    }
+
+    #[test]
+    fn transfer_updates_balances() {
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let mut state = State::new();
+
+        state.create_account(alice, 1_000);
+        state.create_account(bob, 0);
+
+        state
+            .transfer(alice, bob, 250)
+            .expect("transfer should work");
+
+        assert_eq!(state.get_account(&alice).unwrap().balance, 750);
+        assert_eq!(state.get_account(&alice).unwrap().nonce, 1);
+        assert_eq!(state.get_account(&bob).unwrap().balance, 250);
+    }
+
+    #[test]
+    fn transfer_without_nonce_does_not_increment_nonce() {
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let mut state = State::new();
+
+        state.create_account(alice, 1_000);
+        state.create_account(bob, 0);
+
+        state
+            .transfer_without_nonce(alice, bob, 250)
+            .expect("transfer should work");
+
+        assert_eq!(state.get_account(&alice).unwrap().balance, 750);
+        assert_eq!(state.get_account(&alice).unwrap().nonce, 0);
+        assert_eq!(state.get_account(&bob).unwrap().balance, 250);
+    }
+
+    #[test]
+    fn insufficient_balance_fails_without_state_change() {
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let mut state = State::new();
+
+        state.create_account(alice, 100);
+        state.create_account(bob, 0);
+
+        let before = state.state_root();
+
+        let result = state.transfer(alice, bob, 200);
+
+        assert_eq!(result, Err("insufficient balance"));
+        assert_eq!(state.state_root(), before);
+        assert_eq!(state.get_account(&alice).unwrap().balance, 100);
+        assert_eq!(state.get_account(&bob).unwrap().balance, 0);
+        assert_eq!(state.get_account(&alice).unwrap().nonce, 0);
+    }
+
+    #[test]
+    fn missing_receiver_fails_without_state_change() {
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let mut state = State::new();
+
+        state.create_account(alice, 1_000);
+
+        let before = state.state_root();
+
+        let result = state.transfer(alice, bob, 200);
+
+        assert_eq!(result, Err("receiver not found"));
+        assert_eq!(state.state_root(), before);
+        assert_eq!(state.get_account(&alice).unwrap().balance, 1_000);
+        assert_eq!(state.get_account(&alice).unwrap().nonce, 0);
+    }
+
+    #[test]
+    fn burn_reduces_balance() {
+        let alice = [1u8; 20];
+
+        let mut state = State::new();
+
+        state.create_account(alice, 1_000);
+
+        state.burn(alice, 300).expect("burn should work");
+
+        assert_eq!(state.get_account(&alice).unwrap().balance, 700);
+        assert_eq!(state.get_account(&alice).unwrap().nonce, 1);
+    }
+
+    #[test]
+    fn burn_cannot_exceed_balance() {
+        let alice = [1u8; 20];
+
+        let mut state = State::new();
+
+        state.create_account(alice, 100);
+
+        let before = state.state_root();
+
+        let result = state.burn(alice, 200);
+
+        assert_eq!(result, Err("insufficient balance"));
+        assert_eq!(state.state_root(), before);
+    }
+
+    #[test]
+    fn empty_state_has_zero_root() {
+        let state = State::new();
+
+        assert_eq!(state.state_root(), zero_hash());
+    }
+
+    #[test]
+    fn state_root_is_deterministic() {
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let mut state = State::new();
+
+        state.create_account(alice, 1_000);
+        state.create_account(bob, 2_000);
+
+        assert_eq!(state.state_root(), state.state_root());
+    }
+
+    #[test]
+    fn state_root_changes_when_state_changes() {
+        let alice = [1u8; 20];
+
+        let mut state = State::new();
+
+        state.create_account(alice, 1_000);
+
+        let root_before = state.state_root();
+
+        state.burn(alice, 100).expect("burn should work");
+
+        let root_after = state.state_root();
+
+        assert_ne!(root_before, root_after);
+    }
+
+    #[test]
+    fn state_root_is_independent_of_insertion_order() {
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let mut state_a = State::new();
+
+        state_a.create_account(alice, 1_000);
+        state_a.create_account(bob, 2_000);
+
+        let mut state_b = State::new();
+
+        state_b.create_account(bob, 2_000);
+        state_b.create_account(alice, 1_000);
+
+        assert_eq!(state_a.state_root(), state_b.state_root());
+    }
+
+    #[test]
+    fn self_transfer_is_safe() {
+        let alice = [1u8; 20];
+
+        let mut state = State::new();
+        state.create_account(alice, 1_000);
+
+        state
+            .transfer(alice, alice, 250)
+            .expect("self transfer should work");
+
+        assert_eq!(state.get_account(&alice).unwrap().balance, 1_000);
+        assert_eq!(state.get_account(&alice).unwrap().nonce, 1);
+    }
+}

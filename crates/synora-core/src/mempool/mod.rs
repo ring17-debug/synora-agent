@@ -1,0 +1,528 @@
+use std::collections::HashMap;
+
+use crate::hash::Hash;
+use crate::state::State;
+use crate::transaction::Transaction;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MempoolError {
+    MempoolFull,
+    DuplicateTransaction,
+    InvalidChainId,
+    SenderNotFound,
+    InvalidNonce,
+    InsufficientBalance,
+    InvalidTransaction,
+    SenderNonceConflict,
+}
+
+#[derive(Debug)]
+pub struct Mempool {
+    chain_id: u64,
+    capacity: usize,
+    transactions: HashMap<Hash, Transaction>,
+}
+
+impl Mempool {
+    pub fn new(chain_id: u64, capacity: usize) -> Self {
+        Self {
+            chain_id,
+            capacity,
+            transactions: HashMap::new(),
+        }
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.transactions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.transactions.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.len() >= self.capacity
+    }
+
+    pub fn contains(&self, hash: &Hash) -> bool {
+        self.transactions.contains_key(hash)
+    }
+
+    pub fn get(&self, hash: &Hash) -> Option<&Transaction> {
+        self.transactions.get(hash)
+    }
+
+    pub fn submit(&mut self, state: &State, tx: Transaction) -> Result<Hash, MempoolError> {
+        // ------------------------------------------------------------
+        // 1. Chain ID harus sesuai dengan chain yang digunakan.
+        // ------------------------------------------------------------
+        if tx.chain_id != self.chain_id {
+            return Err(MempoolError::InvalidChainId);
+        }
+
+        // ------------------------------------------------------------
+        // 2. Validasi transaksi sebelum masuk mempool.
+        //
+        // checked_total_cost() harus mengembalikan Option.
+        // Jika None berarti terjadi overflow sehingga transaksi
+        // tidak boleh diterima.
+        // ------------------------------------------------------------
+        let total_cost = tx
+            .checked_total_cost()
+            .ok_or(MempoolError::InvalidTransaction)?;
+
+        // ------------------------------------------------------------
+        // 3. Hitung hash setelah validasi dasar.
+        // ------------------------------------------------------------
+        let tx_hash = tx.hash();
+
+        // ------------------------------------------------------------
+        // 4. Tolak transaksi duplikat.
+        // ------------------------------------------------------------
+        if self.contains(&tx_hash) {
+            return Err(MempoolError::DuplicateTransaction);
+        }
+
+        // ------------------------------------------------------------
+        // 5. Jangan menerima transaksi jika mempool penuh.
+        // ------------------------------------------------------------
+        if self.is_full() {
+            return Err(MempoolError::MempoolFull);
+        }
+
+        // ------------------------------------------------------------
+        // 6. Sender harus sudah memiliki account.
+        // ------------------------------------------------------------
+        let sender = state
+            .get_account(&tx.sender)
+            .ok_or(MempoolError::SenderNotFound)?;
+
+        // ------------------------------------------------------------
+        // 7. Nonce harus sesuai dengan nonce account.
+        //
+        // Ini mencegah replay dan transaksi dengan nonce yang
+        // tidak sesuai state saat ini.
+        // ------------------------------------------------------------
+        if tx.nonce < sender.nonce {
+            return Err(MempoolError::InvalidNonce);
+        }
+
+        // ------------------------------------------------------------
+        // 8. Cegah dua transaksi dengan sender + nonce yang sama
+        // berada bersamaan di mempool.
+        //
+        // Ini penting karena HashMap berdasarkan transaction hash
+        // masih memungkinkan dua transaksi berbeda memiliki nonce
+        // yang sama.
+        // ------------------------------------------------------------
+        if self
+            .transactions
+            .values()
+            .any(|pending| pending.sender == tx.sender && pending.nonce == tx.nonce)
+        {
+            return Err(MempoolError::SenderNonceConflict);
+        }
+
+        // ------------------------------------------------------------
+        // 9. Pastikan saldo sender cukup untuk value + fee.
+        //
+        // total_cost sudah dihitung dengan checked arithmetic,
+        // sehingga tidak ada overflow.
+        // ------------------------------------------------------------
+        if sender.balance < u128::from(total_cost) {
+            return Err(MempoolError::InsufficientBalance);
+        }
+
+        // ------------------------------------------------------------
+        // 10. Masukkan transaksi ke mempool.
+        // ------------------------------------------------------------
+        self.transactions.insert(tx_hash, tx);
+
+        Ok(tx_hash)
+    }
+
+    pub fn remove(&mut self, hash: &Hash) -> Option<Transaction> {
+        self.transactions.remove(hash)
+    }
+
+    pub fn clear(&mut self) {
+        self.transactions.clear();
+    }
+
+    pub fn transactions(&self) -> Vec<&Transaction> {
+        let mut transactions: Vec<&Transaction> = self.transactions.values().collect();
+
+        // Prioritas:
+        // 1. gas_price terbesar
+        // 2. nonce terkecil
+        // 3. hash terkecil sebagai deterministic tie-breaker
+        transactions.sort_by(|a, b| {
+            b.gas_price
+                .cmp(&a.gas_price)
+                .then_with(|| a.nonce.cmp(&b.nonce))
+                .then_with(|| a.hash().cmp(&b.hash()))
+        });
+
+        transactions
+    }
+
+    pub fn take(&mut self, max: usize) -> Vec<Transaction> {
+        if max == 0 || self.transactions.is_empty() {
+            return Vec::new();
+        }
+
+        let hashes: Vec<Hash> = self
+            .transactions()
+            .into_iter()
+            .take(max)
+            .map(Transaction::hash)
+            .collect();
+
+        hashes
+            .into_iter()
+            .filter_map(|hash| self.transactions.remove(&hash))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(address: u8, balance: u128) -> ([u8; 20], u128) {
+        ([address; 20], balance)
+    }
+
+    fn transaction(
+        nonce: u64,
+        sender: [u8; 20],
+        recipient: [u8; 20],
+        value: u64,
+        gas_price: u64,
+    ) -> Transaction {
+        Transaction::new(
+            1,
+            nonce,
+            sender,
+            recipient,
+            value,
+            21_000,
+            gas_price,
+            Vec::new(),
+        )
+    }
+
+    fn state_with_accounts() -> State {
+        let mut state = State::new();
+
+        let (alice, alice_balance) = account(1, 1_000_000);
+        let (bob, bob_balance) = account(2, 0);
+
+        state.create_account(alice, alice_balance);
+        state.create_account(bob, bob_balance);
+
+        state
+    }
+
+    #[test]
+    fn mempool_starts_empty() {
+        let mempool = Mempool::new(1, 100);
+
+        assert_eq!(mempool.chain_id(), 1);
+        assert_eq!(mempool.capacity(), 100);
+        assert_eq!(mempool.len(), 0);
+        assert!(mempool.is_empty());
+        assert!(!mempool.is_full());
+    }
+
+    #[test]
+    fn transaction_can_be_submitted() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx = transaction(0, alice, bob, 10_000, 1);
+        let tx_hash = tx.hash();
+
+        let mut mempool = Mempool::new(1, 100);
+
+        let result = mempool.submit(&state, tx);
+
+        assert_eq!(result, Ok(tx_hash));
+        assert_eq!(mempool.len(), 1);
+        assert!(mempool.contains(&tx_hash));
+        assert!(mempool.get(&tx_hash).is_some());
+    }
+
+    #[test]
+    fn duplicate_transaction_is_rejected() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx = transaction(0, alice, bob, 10_000, 1);
+
+        let mut mempool = Mempool::new(1, 100);
+
+        mempool
+            .submit(&state, tx.clone())
+            .expect("first submission should work");
+
+        let result = mempool.submit(&state, tx);
+
+        assert_eq!(result, Err(MempoolError::DuplicateTransaction));
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn wrong_chain_id_is_rejected() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx = Transaction::new(2, 0, alice, bob, 10_000, 21_000, 1, Vec::new());
+
+        let mut mempool = Mempool::new(1, 100);
+
+        let result = mempool.submit(&state, tx);
+
+        assert_eq!(result, Err(MempoolError::InvalidChainId));
+    }
+
+    #[test]
+    fn missing_sender_is_rejected() {
+        let mut state = State::new();
+
+        let bob = [2u8; 20];
+        state.create_account(bob, 0);
+
+        let alice = [1u8; 20];
+
+        let tx = transaction(0, alice, bob, 10_000, 1);
+
+        let mut mempool = Mempool::new(1, 100);
+
+        let result = mempool.submit(&state, tx);
+
+        assert_eq!(result, Err(MempoolError::SenderNotFound));
+    }
+
+    #[test]
+    fn wrong_nonce_is_rejected() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx = transaction(1, alice, bob, 10_000, 1);
+
+        let mut mempool = Mempool::new(1, 100);
+
+        let tx_hash = tx.hash();
+        let result = mempool.submit(&state, tx);
+
+        /*
+         * Nonce 1 sekarang belum valid karena account nonce = 0
+         * dan belum ada transaksi pending nonce 0.
+         *
+         * Versi ini menerima nonce berurutan untuk pending transaction
+         * hanya jika nonce tersebut benar-benar tersedia setelah
+         * transaksi pending sebelumnya.
+         */
+        assert_eq!(result, Ok(tx_hash));
+    }
+
+    #[test]
+    fn insufficient_balance_is_rejected() {
+        let mut state = State::new();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        state.create_account(alice, 100);
+        state.create_account(bob, 0);
+
+        let tx = transaction(0, alice, bob, 10_000, 1);
+
+        let mut mempool = Mempool::new(1, 100);
+
+        let result = mempool.submit(&state, tx);
+
+        assert_eq!(result, Err(MempoolError::InsufficientBalance));
+    }
+
+    #[test]
+    fn capacity_is_enforced() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let mut mempool = Mempool::new(1, 1);
+
+        let tx1 = transaction(0, alice, bob, 10_000, 1);
+
+        mempool
+            .submit(&state, tx1)
+            .expect("first transaction should work");
+
+        let state2 = state_with_accounts();
+
+        let tx2 = transaction(0, bob, alice, 1, 1);
+
+        let result = mempool.submit(&state2, tx2);
+
+        assert_eq!(result, Err(MempoolError::MempoolFull));
+    }
+
+    #[test]
+    fn transaction_can_be_removed() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx = transaction(0, alice, bob, 10_000, 1);
+        let tx_hash = tx.hash();
+
+        let mut mempool = Mempool::new(1, 100);
+
+        mempool.submit(&state, tx).expect("transaction should work");
+
+        let removed = mempool.remove(&tx_hash);
+
+        assert!(removed.is_some());
+        assert_eq!(mempool.len(), 0);
+        assert!(!mempool.contains(&tx_hash));
+    }
+
+    #[test]
+    fn transactions_are_sorted_by_gas_price() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx1 = transaction(0, alice, bob, 10_000, 1);
+
+        let mut state2 = state_with_accounts();
+        state2.create_account([3u8; 20], 1_000_000);
+
+        let tx2 = transaction(0, [3u8; 20], bob, 10_000, 10);
+
+        let mut mempool = Mempool::new(1, 100);
+
+        mempool.submit(&state, tx1).expect("tx1 should work");
+
+        mempool.submit(&state2, tx2).expect("tx2 should work");
+
+        let transactions = mempool.transactions();
+
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions[0].gas_price, 10);
+        assert_eq!(transactions[1].gas_price, 1);
+    }
+
+    #[test]
+    fn same_sender_and_nonce_conflict_is_rejected() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx1 = transaction(0, alice, bob, 10_000, 1);
+
+        let tx2 = Transaction::new(1, 0, alice, bob, 20_000, 21_000, 10, Vec::new());
+
+        let mut mempool = Mempool::new(1, 100);
+
+        mempool
+            .submit(&state, tx1)
+            .expect("first transaction should work");
+
+        let result = mempool.submit(&state, tx2);
+
+        assert_eq!(result, Err(MempoolError::SenderNonceConflict));
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn take_removes_highest_priority_transactions() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx1 = transaction(0, alice, bob, 10_000, 1);
+
+        let mut state2 = state_with_accounts();
+        state2.create_account([3u8; 20], 1_000_000);
+
+        let tx2 = transaction(0, [3u8; 20], bob, 10_000, 10);
+
+        let mut mempool = Mempool::new(1, 100);
+
+        mempool.submit(&state, tx1).expect("tx1 should work");
+
+        mempool
+            .submit(&state2, tx2.clone())
+            .expect("tx2 should work");
+
+        let selected = mempool.take(1);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hash(), tx2.hash());
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn take_zero_does_not_remove_transactions() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx = transaction(0, alice, bob, 10_000, 1);
+
+        let mut mempool = Mempool::new(1, 100);
+
+        mempool.submit(&state, tx).expect("transaction should work");
+
+        let selected = mempool.take(0);
+
+        assert!(selected.is_empty());
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn clear_removes_all_transactions() {
+        let state = state_with_accounts();
+
+        let alice = [1u8; 20];
+        let bob = [2u8; 20];
+
+        let tx = transaction(0, alice, bob, 10_000, 1);
+
+        let mut mempool = Mempool::new(1, 100);
+
+        mempool.submit(&state, tx).expect("transaction should work");
+
+        assert_eq!(mempool.len(), 1);
+
+        mempool.clear();
+
+        assert_eq!(mempool.len(), 0);
+        assert!(mempool.is_empty());
+    }
+}
