@@ -1,12 +1,38 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use synora_core::{block::Block, state::Address, transaction::Transaction};
 
 use crate::node::{NodeError, SynoraNode};
+
+#[derive(Debug, Deserialize)]
+struct TransactionRequest {
+    chain_id: u64,
+    nonce: u64,
+    sender: String,
+    recipient: String,
+    value: u64,
+    gas_limit: u64,
+    gas_price: u64,
+    #[serde(default)]
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TransactionAcceptedResponse {
+    status: &'static str,
+    hash: String,
+    pending_transactions: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TransactionRejectedResponse {
+    status: &'static str,
+    error: String,
+}
 
 pub struct RpcServer {
     address: String,
@@ -69,12 +95,7 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
         Some(line) => line,
 
         None => {
-            return send_response(
-                stream,
-                400,
-                "application/json",
-                r#"{"error":"invalid HTTP request"}"#,
-            );
+            return send_response(stream, 400, r#"{"error":"invalid HTTP request"}"#);
         }
     };
 
@@ -85,30 +106,21 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
 
     println!("RPC            : {} {}", method, path);
 
-    /*
-     * POST /transaction
-     *
-     * Transaction body is extracted from the HTTP request.
-     */
     if method == "POST" && path == "/transaction" {
         let body = match extract_body(&request) {
             Some(body) => body,
 
             None => {
-                return send_response(
-                    stream,
-                    400,
-                    "application/json",
-                    r#"{"error":"request body is required"}"#,
-                );
+                return send_response(stream, 400, r#"{"error":"request body is required"}"#);
             }
         };
 
         return handle_submit_transaction(stream, node, body);
     }
 
-    let response = match (method, path) {
-        ("GET", "/") => (
+    match (method, path) {
+        ("GET", "/") => send_response(
+            stream,
             200,
             r#"{
   "name":"Synora",
@@ -119,14 +131,12 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
 
         ("GET", "/status") => {
             let json = status_json(node);
-
-            return send_response(stream, 200, "application/json", &json);
+            send_response(stream, 200, &json)
         }
 
         ("GET", "/block/latest") => {
             let json = block_json(node.chain().latest_block());
-
-            return send_response(stream, 200, "application/json", &json);
+            send_response(stream, 200, &json)
         }
 
         ("GET", "/mempool") => {
@@ -135,38 +145,27 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
                 node.pending_transactions()
             );
 
-            return send_response(stream, 200, "application/json", &json);
+            send_response(stream, 200, &json)
         }
 
         ("POST", "/block/produce") => match node.produce_block(None) {
             Ok(block) => {
                 let json = block_json(&block);
-
-                return send_response(stream, 200, "application/json", &json);
+                send_response(stream, 200, &json)
             }
 
             Err(NodeError::NoTransactions) => {
-                return send_response(
-                    stream,
-                    409,
-                    "application/json",
-                    r#"{"error":"no transactions available"}"#,
-                );
+                send_response(stream, 409, r#"{"error":"no transactions available"}"#)
             }
 
             Err(NodeError::BlockGasLimitExceeded) => {
-                return send_response(
-                    stream,
-                    409,
-                    "application/json",
-                    r#"{"error":"block gas limit exceeded"}"#,
-                );
+                send_response(stream, 409, r#"{"error":"block gas limit exceeded"}"#)
             }
 
             Err(error) => {
                 let json = format!(r#"{{"error":"{}"}}"#, json_escape(&format!("{:?}", error)));
 
-                return send_response(stream, 500, "application/json", &json);
+                send_response(stream, 500, &json)
             }
         },
 
@@ -177,15 +176,13 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
                         Ok(height) => match node.chain().block(height) {
                             Some(block) => {
                                 let json = block_json(block);
-
-                                return send_response(stream, 200, "application/json", &json);
+                                return send_response(stream, 200, &json);
                             }
 
                             None => {
                                 return send_response(
                                     stream,
                                     404,
-                                    "application/json",
                                     r#"{"error":"block not found"}"#,
                                 );
                             }
@@ -195,7 +192,6 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
                             return send_response(
                                 stream,
                                 400,
-                                "application/json",
                                 r#"{"error":"invalid block height"}"#,
                             );
                         }
@@ -204,54 +200,37 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
 
                 if let Some(address) = path.strip_prefix("/state/") {
                     match parse_address(address) {
-                        Some(address) => {
-                            let account = node.state().get_account(&address);
+                        Some(address) => match node.state().get_account(&address) {
+                            Some(account) => {
+                                let json = format!(
+                                    r#"{{"address":"{}","balance":{},"nonce":{}}}"#,
+                                    address_hex(&address),
+                                    account.balance,
+                                    account.nonce
+                                );
 
-                            match account {
-                                Some(account) => {
-                                    let json = format!(
-                                        r#"{{"address":"{}","balance":{},"nonce":{}}}"#,
-                                        address_hex(&address),
-                                        account.balance,
-                                        account.nonce
-                                    );
-
-                                    return send_response(stream, 200, "application/json", &json);
-                                }
-
-                                None => {
-                                    return send_response(
-                                        stream,
-                                        404,
-                                        "application/json",
-                                        r#"{"error":"account not found"}"#,
-                                    );
-                                }
+                                return send_response(stream, 200, &json);
                             }
-                        }
+
+                            None => {
+                                return send_response(
+                                    stream,
+                                    404,
+                                    r#"{"error":"account not found"}"#,
+                                );
+                            }
+                        },
 
                         None => {
-                            return send_response(
-                                stream,
-                                400,
-                                "application/json",
-                                r#"{"error":"invalid address"}"#,
-                            );
+                            return send_response(stream, 400, r#"{"error":"invalid address"}"#);
                         }
                     }
                 }
             }
 
-            return send_response(
-                stream,
-                404,
-                "application/json",
-                r#"{"error":"route not found"}"#,
-            );
+            send_response(stream, 404, r#"{"error":"route not found"}"#)
         }
-    };
-
-    send_response(stream, response.0, "application/json", response.1)
+    }
 }
 
 fn handle_submit_transaction(
@@ -263,9 +242,12 @@ fn handle_submit_transaction(
         Ok(transaction) => transaction,
 
         Err(error) => {
-            let json = format!(r#"{{"error":"{}"}}"#, json_escape(&error));
+            let response = TransactionRejectedResponse {
+                status: "rejected",
+                error,
+            };
 
-            return send_response(stream, 400, "application/json", &json);
+            return send_json_response(stream, 400, &response);
         }
     };
 
@@ -273,17 +255,13 @@ fn handle_submit_transaction(
 
     match node.submit_transaction(transaction) {
         Ok(()) => {
-            let json = format!(
-                r#"{{
-  "status":"accepted",
-  "hash":"{}",
-  "pending_transactions":{}
-}}"#,
-                hash_hex(&transaction_hash),
-                node.pending_transactions(),
-            );
+            let response = TransactionAcceptedResponse {
+                status: "accepted",
+                hash: hash_hex(&transaction_hash),
+                pending_transactions: node.pending_transactions(),
+            };
 
-            send_response(stream, 200, "application/json", &json)
+            send_json_response(stream, 200, &response)
         }
 
         Err(error) => {
@@ -294,46 +272,37 @@ fn handle_submit_transaction(
                 NodeError::BlockGasLimitExceeded => 409,
             };
 
-            let json = format!(
-                r#"{{"status":"rejected","error":"{}"}}"#,
-                json_escape(&format!("{:?}", error))
-            );
+            let response = TransactionRejectedResponse {
+                status: "rejected",
+                error: format!("{:?}", error),
+            };
 
-            send_response(stream, status, "application/json", &json)
+            send_json_response(stream, status, &response)
         }
     }
 }
 
 fn parse_transaction_json(body: &str) -> Result<Transaction, String> {
-    let chain_id =
-        json_u64(body, "chain_id").ok_or_else(|| "missing or invalid chain_id".to_string())?;
+    let request: TransactionRequest = serde_json::from_str(body)
+        .map_err(|error| format!("invalid transaction JSON: {}", error))?;
 
-    let nonce = json_u64(body, "nonce").ok_or_else(|| "missing or invalid nonce".to_string())?;
-
-    let sender_text = json_string(body, "sender").ok_or_else(|| "missing sender".to_string())?;
-
-    let recipient_text =
-        json_string(body, "recipient").ok_or_else(|| "missing recipient".to_string())?;
-
-    let sender = parse_address(&sender_text).ok_or_else(|| "invalid sender address".to_string())?;
+    let sender =
+        parse_address(&request.sender).ok_or_else(|| "invalid sender address".to_string())?;
 
     let recipient =
-        parse_address(&recipient_text).ok_or_else(|| "invalid recipient address".to_string())?;
+        parse_address(&request.recipient).ok_or_else(|| "invalid recipient address".to_string())?;
 
-    let value = json_u64(body, "value").ok_or_else(|| "missing or invalid value".to_string())?;
-
-    let gas_limit =
-        json_u64(body, "gas_limit").ok_or_else(|| "missing or invalid gas_limit".to_string())?;
-
-    let gas_price =
-        json_u64(body, "gas_price").ok_or_else(|| "missing or invalid gas_price".to_string())?;
-
-    let data_text = json_string(body, "data").unwrap_or_default();
-
-    let data = parse_hex_bytes(&data_text).ok_or_else(|| "invalid data hex".to_string())?;
+    let data = parse_hex_bytes(&request.data).ok_or_else(|| "invalid data hex".to_string())?;
 
     Ok(Transaction::new(
-        chain_id, nonce, sender, recipient, value, gas_limit, gas_price, data,
+        request.chain_id,
+        request.nonce,
+        sender,
+        recipient,
+        request.value,
+        request.gas_limit,
+        request.gas_price,
+        data,
     ))
 }
 
@@ -342,66 +311,6 @@ fn extract_body(request: &str) -> Option<&str> {
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
         .or_else(|| request.split_once("\n\n").map(|(_, body)| body))
-}
-
-fn json_u64(body: &str, key: &str) -> Option<u64> {
-    let marker = format!(r#""{}":"#, key);
-
-    let start = body.find(&marker)?;
-    let rest = &body[start + marker.len()..];
-
-    let rest = rest.trim_start();
-
-    let end = rest
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(rest.len());
-
-    if end == 0 {
-        return None;
-    }
-
-    rest[..end].parse().ok()
-}
-
-fn json_string(body: &str, key: &str) -> Option<String> {
-    let marker = format!(r#""{}":"#, key);
-
-    let start = body.find(&marker)?;
-    let rest = &body[start + marker.len()..];
-
-    let rest = rest.trim_start();
-
-    if !rest.starts_with('"') {
-        return None;
-    }
-
-    let rest = &rest[1..];
-
-    let end = rest.find('"')?;
-
-    Some(rest[..end].to_string())
-}
-
-fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
-    let value = value.strip_prefix("0x").unwrap_or(value);
-
-    if value.is_empty() {
-        return Some(Vec::new());
-    }
-
-    if !value.len().is_multiple_of(2) {
-        return None;
-    }
-
-    let mut result = Vec::with_capacity(value.len() / 2);
-
-    for chunk in value.as_bytes().chunks(2) {
-        let text = std::str::from_utf8(chunk).ok()?;
-
-        result.push(u8::from_str_radix(text, 16).ok()?);
-    }
-
-    Some(result)
 }
 
 fn status_json(node: &SynoraNode) -> String {
@@ -479,12 +388,18 @@ fn block_json(block: &Block) -> String {
     )
 }
 
-fn send_response(
+fn send_json_response<T: Serialize>(
     stream: &mut TcpStream,
     status: u16,
-    content_type: &str,
-    body: &str,
+    value: &T,
 ) -> std::io::Result<()> {
+    let body =
+        serde_json::to_string_pretty(value).expect("RPC response serialization should never fail");
+
+    send_response(stream, status, &body)
+}
+
+fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
     let status_text = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -496,14 +411,13 @@ fn send_response(
 
     let response = format!(
         "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
+         Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
         status,
         status_text,
-        content_type,
         body.len(),
         body,
     );
@@ -556,6 +470,27 @@ fn parse_address(value: &str) -> Option<Address> {
     Some(address)
 }
 
+fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+
+    if value.is_empty() {
+        return Some(Vec::new());
+    }
+
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let mut result = Vec::with_capacity(value.len() / 2);
+
+    for chunk in value.as_bytes().chunks(2) {
+        let text = std::str::from_utf8(chunk).ok()?;
+        result.push(u8::from_str_radix(text, 16).ok()?);
+    }
+
+    Some(result)
+}
+
 fn json_escape(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -563,12 +498,4 @@ fn json_escape(value: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
-}
-
-#[allow(dead_code)]
-fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
