@@ -204,28 +204,43 @@ fn calculate_transactions_root(transactions: &[Transaction]) -> Hash {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::Keypair;
 
+    /*
+     * IMPORTANT:
+     *
+     * Alice's address MUST come from the same keypair that signs
+     * the transactions. Using [1u8; 20] as a fake address would
+     * cause signature/address validation to fail.
+     */
     fn addresses() -> (Address, Address, Address) {
-        ([1u8; 20], [2u8; 20], [3u8; 20])
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
+
+        (alice_keypair.address(), [2u8; 20], [3u8; 20])
     }
 
     fn transaction(
         chain_id: u64,
         nonce: u64,
-        sender: Address,
+        keypair: &Keypair,
         recipient: Address,
         value: u64,
     ) -> Transaction {
-        Transaction::new(
+        let mut tx = Transaction::new(
             chain_id,
             nonce,
-            sender,
+            keypair.address(),
             recipient,
             value,
             21_000,
             1,
             Vec::new(),
-        )
+        );
+
+        tx.sign(keypair)
+            .expect("test transaction should be signable");
+
+        tx
     }
 
     fn create_chain() -> Blockchain {
@@ -254,16 +269,24 @@ mod tests {
     fn transaction_can_be_executed() {
         let mut chain = create_chain();
 
-        let (alice, bob, _) = addresses();
+        let (_, bob, _) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
 
-        let tx = transaction(1, 0, alice, bob, 10_000);
+        let tx = transaction(1, 0, &alice_keypair, bob, 10_000);
 
         let receipt = chain
             .execute_transaction(&tx)
             .expect("transaction should execute");
 
         assert_eq!(receipt.transaction_hash, tx.hash());
-        assert_eq!(chain.state().get_account(&alice).unwrap().balance, 969_000);
+        assert_eq!(
+            chain
+                .state()
+                .get_account(&alice_keypair.address())
+                .unwrap()
+                .balance,
+            969_000
+        );
         assert_eq!(chain.state().get_account(&bob).unwrap().balance, 10_000);
     }
 
@@ -271,9 +294,10 @@ mod tests {
     fn block_can_be_produced() {
         let mut chain = create_chain();
 
-        let (alice, bob, _) = addresses();
+        let (_, bob, _) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
 
-        let tx = transaction(1, 0, alice, bob, 10_000);
+        let tx = transaction(1, 0, &alice_keypair, bob, 10_000);
 
         let block = chain
             .produce_block(1_700_000_100, vec![tx])
@@ -288,9 +312,10 @@ mod tests {
     fn produced_block_links_to_previous_block() {
         let mut chain = create_chain();
 
-        let (alice, bob, _) = addresses();
+        let (_, bob, _) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
 
-        let tx = transaction(1, 0, alice, bob, 10_000);
+        let tx = transaction(1, 0, &alice_keypair, bob, 10_000);
 
         let block = chain
             .produce_block(1_700_000_100, vec![tx])
@@ -303,9 +328,10 @@ mod tests {
     fn wrong_chain_transaction_is_rejected() {
         let mut chain = create_chain();
 
-        let (alice, bob, _) = addresses();
+        let (_, bob, _) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
 
-        let tx = transaction(999, 0, alice, bob, 10_000);
+        let tx = transaction(999, 0, &alice_keypair, bob, 10_000);
 
         let result = chain.execute_transaction(&tx);
 
@@ -345,14 +371,15 @@ mod tests {
     fn failed_block_does_not_modify_state() {
         let mut chain = create_chain();
 
-        let (alice, bob, _) = addresses();
+        let (_, bob, _) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
 
         let before_root = chain.state().state_root();
         let before_height = chain.height();
 
-        let tx1 = transaction(1, 0, alice, bob, 10_000);
+        let tx1 = transaction(1, 0, &alice_keypair, bob, 10_000);
 
-        let tx2 = transaction(1, 5, alice, bob, 10_000);
+        let tx2 = transaction(1, 5, &alice_keypair, bob, 10_000);
 
         let result = chain.produce_block(1_700_000_100, vec![tx1, tx2]);
 
@@ -362,6 +389,7 @@ mod tests {
         ));
 
         assert_eq!(chain.state().state_root(), before_root);
+
         assert_eq!(chain.height(), before_height);
     }
 
@@ -369,17 +397,28 @@ mod tests {
     fn block_can_execute_multiple_sequential_transactions() {
         let mut chain = create_chain();
 
-        let (alice, bob, _) = addresses();
+        let (_, bob, _) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
 
-        let tx1 = transaction(1, 0, alice, bob, 10_000);
-        let tx2 = transaction(1, 1, alice, bob, 20_000);
+        let tx1 = transaction(1, 0, &alice_keypair, bob, 10_000);
+
+        let tx2 = transaction(1, 1, &alice_keypair, bob, 20_000);
 
         let block = chain
             .produce_block(1_700_000_100, vec![tx1, tx2])
             .expect("block should be produced");
 
         assert_eq!(block.transaction_count(), 2);
-        assert_eq!(chain.state().get_account(&alice).unwrap().nonce, 2);
+
+        assert_eq!(
+            chain
+                .state()
+                .get_account(&alice_keypair.address())
+                .unwrap()
+                .nonce,
+            2
+        );
+
         assert_eq!(chain.state().get_account(&bob).unwrap().balance, 30_000);
     }
 }

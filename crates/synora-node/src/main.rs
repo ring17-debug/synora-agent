@@ -1,6 +1,7 @@
 mod config;
 mod node;
 mod rpc;
+mod rpc_client;
 
 use config::NodeConfig;
 use node::SynoraNode;

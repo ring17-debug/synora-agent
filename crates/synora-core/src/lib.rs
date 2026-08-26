@@ -2,6 +2,7 @@ pub const SYNORA_VERSION: &str = "0.1.0";
 
 pub mod block;
 pub mod chain;
+pub mod crypto;
 pub mod execution;
 pub mod hash;
 pub mod mempool;
@@ -15,6 +16,7 @@ pub fn version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::Keypair;
 
     #[test]
     fn synora_version_exists() {
@@ -69,7 +71,8 @@ mod tests {
 
     #[test]
     fn executor_can_execute_transaction() {
-        let alice = [1u8; 20];
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
+        let alice = alice_keypair.address();
         let bob = [2u8; 20];
         let fee_recipient = [3u8; 20];
 
@@ -79,7 +82,10 @@ mod tests {
         state.create_account(bob, 0);
         state.create_account(fee_recipient, 0);
 
-        let tx = transaction::Transaction::new(1, 0, alice, bob, 10_000, 21_000, 1, Vec::new());
+        let mut tx = transaction::Transaction::new(1, 0, alice, bob, 10_000, 21_000, 1, Vec::new());
+
+        tx.sign(&alice_keypair)
+            .expect("transaction should be signable");
 
         let executor = execution::Executor::new(1, fee_recipient);
 

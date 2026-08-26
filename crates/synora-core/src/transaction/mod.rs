@@ -1,3 +1,4 @@
+use crate::crypto::{CryptoError, Keypair, verify_address, verify_signature};
 use crate::hash::{Hash, hash};
 
 pub type Address = [u8; 20];
@@ -7,6 +8,9 @@ pub type Address = [u8; 20];
 /// Keeping this bounded prevents an attacker from submitting arbitrarily
 /// large transactions and consuming excessive memory in the mempool/block.
 pub const MAX_TRANSACTION_DATA_SIZE: usize = 128 * 1024;
+
+pub const PUBLIC_KEY_SIZE: usize = 32;
+pub const SIGNATURE_SIZE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
@@ -18,6 +22,8 @@ pub struct Transaction {
     pub gas_limit: u64,
     pub gas_price: u64,
     pub data: Vec<u8>,
+    pub public_key: [u8; PUBLIC_KEY_SIZE],
+    pub signature: [u8; SIGNATURE_SIZE],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +55,8 @@ impl Transaction {
             gas_limit,
             gas_price,
             data,
+            public_key: [0u8; PUBLIC_KEY_SIZE],
+            signature: [0u8; SIGNATURE_SIZE],
         }
     }
 
@@ -102,6 +110,53 @@ impl Transaction {
         !self.data.is_empty()
     }
 
+    /// Returns true when the transaction contains a public key and signature.
+    pub fn is_signed(&self) -> bool {
+        self.public_key != [0u8; PUBLIC_KEY_SIZE] && self.signature != [0u8; SIGNATURE_SIZE]
+    }
+
+    /// Calculate the hash that is signed by the sender.
+    ///
+    /// The public key and signature are intentionally excluded from this
+    /// hash. This keeps the transaction hash stable before and after signing.
+    pub fn signing_hash(&self) -> Hash {
+        self.hash()
+    }
+
+    /// Sign the transaction with the supplied keypair.
+    ///
+    /// The keypair must correspond to the transaction sender.
+    pub fn sign(&mut self, keypair: &Keypair) -> Result<(), CryptoError> {
+        let public_key = keypair.public_key_bytes();
+
+        verify_address(&public_key, &self.sender)?;
+
+        let signing_hash = self.signing_hash();
+        let signature = keypair.sign(&signing_hash);
+
+        self.public_key = public_key;
+        self.signature = signature;
+
+        Ok(())
+    }
+
+    /// Verify that the transaction signature belongs to its sender.
+    pub fn verify_signature(&self) -> Result<(), CryptoError> {
+        if !self.is_signed() {
+            return Err(CryptoError::InvalidSignature);
+        }
+
+        verify_address(&self.public_key, &self.sender)?;
+
+        let signing_hash = self.signing_hash();
+
+        verify_signature(&self.public_key, &self.signature, &signing_hash)
+    }
+
+    /// Return the canonical transaction hash.
+    ///
+    /// Signature and public key are excluded intentionally. The transaction
+    /// identity is determined by the signed transaction payload itself.
     pub fn hash(&self) -> Hash {
         let mut bytes = Vec::with_capacity(8 + 8 + 20 + 20 + 8 + 8 + 8 + 8 + self.data.len());
 
@@ -136,6 +191,7 @@ mod tests {
         assert_eq!(tx.total_fee(), 21_000);
         assert_eq!(tx.total_cost(), 31_000);
         assert!(!tx.is_contract_call());
+        assert!(!tx.is_signed());
     }
 
     #[test]
@@ -143,6 +199,7 @@ mod tests {
         let tx = test_transaction();
 
         assert_eq!(tx.hash(), tx.hash());
+        assert_eq!(tx.signing_hash(), tx.hash());
     }
 
     #[test]
@@ -204,5 +261,80 @@ mod tests {
         );
 
         assert_eq!(tx.validate(), Err(TransactionValidationError::DataTooLarge));
+    }
+}
+
+#[cfg(test)]
+mod signing_tests {
+    use super::*;
+    use crate::crypto::Keypair;
+
+    fn unsigned_transaction(sender: Address) -> Transaction {
+        Transaction::new(1337, 0, sender, [2u8; 20], 10_000, 21_000, 1, Vec::new())
+    }
+
+    #[test]
+    fn transaction_can_be_signed_and_verified() {
+        let keypair = Keypair::generate();
+
+        let mut tx = unsigned_transaction(keypair.address());
+
+        assert!(!tx.is_signed());
+
+        tx.sign(&keypair).expect("transaction should be signed");
+
+        assert!(tx.is_signed());
+
+        tx.verify_signature().expect("signature should be valid");
+    }
+
+    #[test]
+    fn modified_transaction_is_rejected() {
+        let keypair = Keypair::generate();
+
+        let mut tx = unsigned_transaction(keypair.address());
+
+        tx.sign(&keypair).expect("transaction should be signed");
+
+        tx.value += 1;
+
+        assert_eq!(tx.verify_signature(), Err(CryptoError::InvalidSignature));
+    }
+
+    #[test]
+    fn wrong_keypair_cannot_sign_for_sender() {
+        let sender_keypair = Keypair::generate();
+        let other_keypair = Keypair::generate();
+
+        let mut tx = unsigned_transaction(sender_keypair.address());
+
+        assert_eq!(tx.sign(&other_keypair), Err(CryptoError::AddressMismatch));
+    }
+
+    #[test]
+    fn unsigned_transaction_is_rejected() {
+        let keypair = Keypair::generate();
+
+        let tx = unsigned_transaction(keypair.address());
+
+        assert!(!tx.is_signed());
+
+        assert_eq!(tx.verify_signature(), Err(CryptoError::InvalidSignature));
+    }
+
+    #[test]
+    fn signing_does_not_change_transaction_hash() {
+        let keypair = Keypair::generate();
+
+        let mut tx = unsigned_transaction(keypair.address());
+
+        let hash_before = tx.hash();
+
+        tx.sign(&keypair).expect("transaction should be signed");
+
+        let hash_after = tx.hash();
+
+        assert_eq!(hash_before, hash_after);
+        assert_eq!(tx.signing_hash(), hash_before);
     }
 }
