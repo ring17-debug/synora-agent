@@ -1,6 +1,7 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -279,6 +280,8 @@ fn parse_content_length(headers: &str) -> std::io::Result<usize> {
 }
 
 fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
     let request = match read_http_request(stream) {
         Ok(request) => request,
 

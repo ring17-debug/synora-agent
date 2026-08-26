@@ -2,3 +2,6 @@
 **/*.bak
 **/*.bak-*
 .backup-*/
+
+# Secrets
+.env
