@@ -1,7 +1,27 @@
 /target/
+
+# Backups / temporary files
 **/*.bak
 **/*.bak-*
-.backup-*/
+**/*.backup
+**/*.backup-*
+**/*.backup*
+**/*.before-compat
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
 
 # Secrets
 .env
+.env.*
+!.env.example
+
+# Synora AI Agent runtime
+.synora-agent/
