@@ -1,12 +1,5 @@
-mod config;
-mod node;
-mod rpc;
-mod rpc_client;
-
-use config::NodeConfig;
-use node::SynoraNode;
-use rpc::RpcServer;
 use synora_core::transaction::Transaction;
+use synora_node::{config::NodeConfig, node::SynoraNode, rpc::RpcServer};
 
 fn main() {
     println!("=================================");
@@ -23,17 +16,12 @@ fn main() {
     let bob = [2u8; 20];
 
     node.create_account(alice, 1_000_000);
-
     node.create_account(bob, 0);
-
     node.create_account(fee_recipient, 0);
 
     println!("Chain ID       : {}", node.chain().chain_id());
-
     println!("Block Height   : {}", node.chain().height());
-
     println!("Block Count    : {}", node.chain().block_count());
-
     println!("Mempool        : {}", node.pending_transactions());
 
     /*

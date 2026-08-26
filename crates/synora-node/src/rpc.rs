@@ -67,6 +67,13 @@ struct StatusResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct AccountResponse {
+    address: String,
+    balance: String,
+    nonce: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct TransactionResponse {
     hash: String,
     status: &'static str,
@@ -76,6 +83,7 @@ struct TransactionResponse {
 
 #[derive(Debug, Serialize)]
 struct TransactionJson {
+    hash: String,
     chain_id: u64,
     nonce: u64,
     sender: String,
@@ -331,9 +339,6 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
     }
 
     match (method, path) {
-        // ---------------------------------------------------------
-        // GET /
-        // ---------------------------------------------------------
         ("GET", "/") => {
             let response = RootResponse {
                 name: "Synora",
@@ -351,9 +356,6 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
             )
         }
 
-        // ---------------------------------------------------------
-        // GET /status
-        // ---------------------------------------------------------
         ("GET", "/status") => {
             let latest_block_hash = encode_hex(&node.chain().latest_block().hash());
 
@@ -374,15 +376,69 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
             )
         }
 
-        // ---------------------------------------------------------
-        // GET /mempool
-        // ---------------------------------------------------------
+        ("GET", "/state/root") => {
+            let response = serde_json::json!({
+                "root": encode_hex(&node.state().state_root()),
+            });
+
+            send_json_response(
+                stream,
+                200,
+                &RpcResponse {
+                    status: "ok",
+                    result: response,
+                },
+            )
+        }
+
+        ("GET", path) if path.starts_with("/state/") => {
+            let address_text = path.trim_start_matches("/state/");
+
+            if address_text.is_empty() {
+                return send_rpc_error(
+                    stream,
+                    400,
+                    "INVALID_ADDRESS",
+                    "account address is required",
+                );
+            }
+
+            let address = match parse_address(address_text) {
+                Ok(address) => address,
+
+                Err(message) => {
+                    return send_rpc_error(stream, 400, "INVALID_ADDRESS", &message);
+                }
+            };
+
+            match node.state().get_account(&address) {
+                Some(account) => {
+                    let response = AccountResponse {
+                        address: encode_hex(&address),
+                        balance: account.balance.to_string(),
+                        nonce: account.nonce,
+                    };
+
+                    send_json_response(
+                        stream,
+                        200,
+                        &RpcResponse {
+                            status: "ok",
+                            result: response,
+                        },
+                    )
+                }
+
+                None => send_rpc_error(stream, 404, "ACCOUNT_NOT_FOUND", "account not found"),
+            }
+        }
+
         ("GET", "/mempool") => {
             let transactions = node
                 .mempool()
                 .transactions()
                 .iter()
-                .map(|transaction| transaction_to_json(transaction))
+                .map(|transaction| transaction_to_json(*transaction))
                 .collect::<Vec<_>>();
 
             send_json_response(
@@ -395,27 +451,19 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
             )
         }
 
-        // ---------------------------------------------------------
-        // GET /block/latest
-        // ---------------------------------------------------------
         ("GET", "/block/latest") => {
             let block = node.chain().latest_block();
-
-            let response = block_to_json(block);
 
             send_json_response(
                 stream,
                 200,
                 &RpcResponse {
                     status: "ok",
-                    result: response,
+                    result: block_to_json(block),
                 },
             )
         }
 
-        // ---------------------------------------------------------
-        // GET /block/:height
-        // ---------------------------------------------------------
         ("GET", path) if path.starts_with("/block/") => {
             let height_text = path.trim_start_matches("/block/");
 
@@ -442,26 +490,19 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
             };
 
             match node.chain().block(height) {
-                Some(block) => {
-                    let response = block_to_json(block);
-
-                    send_json_response(
-                        stream,
-                        200,
-                        &RpcResponse {
-                            status: "ok",
-                            result: response,
-                        },
-                    )
-                }
+                Some(block) => send_json_response(
+                    stream,
+                    200,
+                    &RpcResponse {
+                        status: "ok",
+                        result: block_to_json(block),
+                    },
+                ),
 
                 None => send_rpc_error(stream, 404, "BLOCK_NOT_FOUND", "block not found"),
             }
         }
 
-        // ---------------------------------------------------------
-        // GET /transaction/:hash
-        // ---------------------------------------------------------
         ("GET", path) if path.starts_with("/transaction/") => {
             let hash_text = path.trim_start_matches("/transaction/");
 
@@ -507,9 +548,6 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
             }
         }
 
-        // ---------------------------------------------------------
-        // POST /transaction
-        // ---------------------------------------------------------
         ("POST", "/transaction") => {
             let body = match extract_body(&request) {
                 Some(body) => body,
@@ -582,29 +620,24 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
             }
         }
 
-        // ---------------------------------------------------------
-        // Unknown route
-        // ---------------------------------------------------------
-        _ => send_rpc_error(stream, 404, "NOT_FOUND", "unknown RPC route"),
-    }
-}
+        ("POST", "/block/produce") => match node.produce_block(None) {
+            Ok(block) => send_json_response(
+                stream,
+                200,
+                &RpcResponse {
+                    status: "ok",
+                    result: block_to_json(&block),
+                },
+            ),
 
-fn block_to_json(block: &Block) -> BlockResponse {
-    BlockResponse {
-        hash: encode_hex(&block.hash()),
-        version: block.header.version,
-        chain_id: block.header.chain_id,
-        height: block.header.height,
-        timestamp: block.header.timestamp,
-        previous_hash: encode_hex(&block.header.previous_hash),
-        state_root: encode_hex(&block.header.state_root),
-        transactions_root: encode_hex(&block.header.transactions_root),
-        transaction_count: block.transactions.len(),
-        transactions: block
-            .transactions
-            .iter()
-            .map(|transaction| transaction_to_json(transaction))
-            .collect(),
+            Err(error) => {
+                let (code, status) = node_error_response(&error);
+
+                send_rpc_error(stream, status, code, &format!("{error:?}"))
+            }
+        },
+
+        _ => send_rpc_error(stream, 404, "NOT_FOUND", "unknown RPC route"),
     }
 }
 
@@ -682,6 +715,7 @@ fn transaction_from_request(request: TransactionRequest) -> Result<Transaction, 
 
 fn transaction_to_json(transaction: &Transaction) -> TransactionJson {
     TransactionJson {
+        hash: encode_hex(&transaction.hash()),
         chain_id: transaction.chain_id,
         nonce: transaction.nonce,
         sender: encode_hex(&transaction.sender),
@@ -692,6 +726,21 @@ fn transaction_to_json(transaction: &Transaction) -> TransactionJson {
         data: encode_hex(&transaction.data),
         public_key: encode_hex(&transaction.public_key),
         signature: encode_hex(&transaction.signature),
+    }
+}
+
+fn block_to_json(block: &Block) -> BlockResponse {
+    BlockResponse {
+        hash: encode_hex(&block.hash()),
+        version: block.header.version,
+        chain_id: block.header.chain_id,
+        height: block.header.height,
+        timestamp: block.header.timestamp,
+        previous_hash: encode_hex(&block.header.previous_hash),
+        state_root: encode_hex(&block.header.state_root),
+        transactions_root: encode_hex(&block.header.transactions_root),
+        transaction_count: block.transactions.len(),
+        transactions: block.transactions.iter().map(transaction_to_json).collect(),
     }
 }
 
@@ -839,7 +888,7 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::node::SynoraNode;
-    use synora_core::crypto::Keypair;
+    use synora_core::{block::Block, crypto::Keypair};
 
     fn test_transaction() -> Transaction {
         let keypair = Keypair::from_bytes(&[1u8; 32]);
@@ -858,12 +907,6 @@ mod tests {
         tx.sign(&keypair).expect("transaction should be signable");
 
         tx
-    }
-
-    fn test_node() -> SynoraNode {
-        let config = crate::config::NodeConfig::new(1337, [0xfe; 20], 100, 1_000_000);
-
-        SynoraNode::new(config, 1_700_000_000)
     }
 
     #[test]
@@ -922,6 +965,7 @@ mod tests {
         let json =
             serde_json::to_string(&transaction_to_json(&tx)).expect("transaction should serialize");
 
+        assert!(json.contains("\"hash\":"));
         assert!(json.contains("\"chain_id\":1337"));
         assert!(json.contains("\"nonce\":0"));
         assert!(json.contains("\"sender\":"));
@@ -929,6 +973,30 @@ mod tests {
         assert!(json.contains("\"data\":\"010203\""));
         assert!(json.contains("\"public_key\":"));
         assert!(json.contains("\"signature\":"));
+    }
+
+    #[test]
+    fn block_json_contains_expected_fields() {
+        let block = Block::genesis(1337, 1_700_000_000);
+
+        let json = serde_json::to_string(&block_to_json(&block)).expect("block should serialize");
+
+        assert!(json.contains("\"hash\":"));
+        assert!(json.contains("\"version\":1"));
+        assert!(json.contains("\"chain_id\":1337"));
+        assert!(json.contains("\"height\":0"));
+        assert!(json.contains("\"timestamp\":1700000000"));
+        assert!(json.contains("\"previous_hash\":"));
+        assert!(json.contains("\"state_root\":"));
+        assert!(json.contains("\"transactions_root\":"));
+        assert!(json.contains("\"transaction_count\":0"));
+        assert!(json.contains("\"transactions\":[]"));
+    }
+
+    #[test]
+    fn invalid_block_height_is_rejected() {
+        assert!("abc".parse::<u64>().is_err());
+        assert!("".parse::<u64>().is_err());
     }
 
     #[test]
@@ -978,49 +1046,5 @@ mod tests {
             encode_hex(&hash),
             "abababababababababababababababababababababababababababababababab"
         );
-    }
-
-    #[test]
-    fn genesis_block_can_be_serialized() {
-        let node = test_node();
-        let block = node.chain().latest_block();
-
-        let response = block_to_json(block);
-
-        assert_eq!(response.height, 0);
-        assert_eq!(response.chain_id, 1337);
-        assert_eq!(response.timestamp, 1_700_000_000);
-        assert_eq!(response.transaction_count, 0);
-        assert!(response.transactions.is_empty());
-        assert_eq!(
-            response.previous_hash,
-            "0000000000000000000000000000000000000000000000000000000000000000"
-        );
-    }
-
-    #[test]
-    fn block_json_contains_expected_fields() {
-        let node = test_node();
-        let block = node.chain().latest_block();
-
-        let json = serde_json::to_string(&block_to_json(block)).expect("block should serialize");
-
-        assert!(json.contains("\"hash\":"));
-        assert!(json.contains("\"version\":1"));
-        assert!(json.contains("\"chain_id\":1337"));
-        assert!(json.contains("\"height\":0"));
-        assert!(json.contains("\"timestamp\":1700000000"));
-        assert!(json.contains("\"previous_hash\":"));
-        assert!(json.contains("\"state_root\":"));
-        assert!(json.contains("\"transactions_root\":"));
-        assert!(json.contains("\"transaction_count\":0"));
-        assert!(json.contains("\"transactions\":[]"));
-    }
-
-    #[test]
-    fn invalid_block_height_is_rejected() {
-        assert!("abc".parse::<u64>().is_err());
-
-        assert!("".parse::<u64>().is_err());
     }
 }
