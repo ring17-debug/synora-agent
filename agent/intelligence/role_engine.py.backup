@@ -1,0 +1,345 @@
+"""
+Synora Role Intelligence V3.
+
+Menghubungkan:
+    RoutingDecision
+        ↓
+    AgentRole
+        ↓
+    role-specific prompt
+        ↓
+    GeminiAdapter
+        ↓
+    structured role result
+
+Design goals:
+- 1 Gemini API key tetap cukup.
+- Role memiliki instruction masing-masing.
+- Router tetap menentukan role.
+- Adapter menangani provider/API.
+- Role engine tidak mengetahui API key.
+- Output Gemini dinormalisasi.
+- Tidak melakukan perubahan file secara langsung.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from .gemini_adapter import GeminiAdapter
+from .roles import AgentRole, get_role
+from .router import RoutingDecision
+
+
+# ============================================================
+# RESULT
+# ============================================================
+
+
+@dataclass(frozen=True)
+class RoleResult:
+    """
+    Hasil eksekusi sebuah role.
+    """
+
+    role: str
+    text: str
+    confidence: float
+    metadata: dict[str, Any]
+
+
+# ============================================================
+# ROLE ENGINE
+# ============================================================
+
+
+class RoleEngine:
+    """
+    Engine untuk menjalankan role intelligence.
+
+    RoleEngine tidak mengetahui:
+    - API key
+    - Gemini client
+    - provider credentials
+
+    Semua komunikasi provider dilakukan oleh GeminiAdapter.
+    """
+
+    def __init__(
+        self,
+        adapter: GeminiAdapter,
+    ) -> None:
+        if adapter is None:
+            raise ValueError(
+                "GeminiAdapter wajib diberikan."
+            )
+
+        self.adapter = adapter
+
+    # --------------------------------------------------------
+    # PROMPT
+    # --------------------------------------------------------
+
+    @staticmethod
+    def build_prompt(
+        role: AgentRole,
+        task: str,
+        context: str = "",
+        previous_result: str = "",
+    ) -> str:
+        """
+        Membuat prompt berdasarkan role.
+
+        Setiap role mendapatkan system instruction sendiri.
+        """
+
+        if not isinstance(task, str):
+            raise TypeError(
+                "task harus string."
+            )
+
+        if not task.strip():
+            raise ValueError(
+                "task tidak boleh kosong."
+            )
+
+        if not isinstance(context, str):
+            raise TypeError(
+                "context harus string."
+            )
+
+        if not isinstance(previous_result, str):
+            raise TypeError(
+                "previous_result harus string."
+            )
+
+        parts = [
+            "===== SYNORA ROLE =====",
+            role.name,
+            "",
+            "===== ROLE DESCRIPTION =====",
+            role.description,
+            "",
+            "===== ROLE INSTRUCTION =====",
+            role.system_instruction.strip(),
+            "",
+            "===== USER TASK =====",
+            task.strip(),
+        ]
+
+        if context.strip():
+            parts.extend(
+                [
+                    "",
+                    "===== PROJECT CONTEXT =====",
+                    context.strip(),
+                ]
+            )
+
+        if previous_result.strip():
+            parts.extend(
+                [
+                    "",
+                    "===== PREVIOUS AGENT RESULT =====",
+                    previous_result.strip(),
+                ]
+            )
+
+        parts.extend(
+            [
+                "",
+                "===== EXECUTION RULES =====",
+                "Gunakan hanya informasi yang tersedia.",
+                "Jangan mengarang API atau source code.",
+                "Jika informasi kurang, nyatakan dengan jelas.",
+                "Fokus pada tanggung jawab role ini.",
+                "Jangan menjalankan perubahan file.",
+                "",
+                "Berikan hasil yang konkret dan dapat diverifikasi.",
+            ]
+        )
+
+        return "\n".join(parts)
+
+    # --------------------------------------------------------
+    # EXECUTE
+    # --------------------------------------------------------
+
+    def execute(
+        self,
+        decision: RoutingDecision,
+        task: str,
+        *,
+        context: str = "",
+        previous_result: str = "",
+        model: Optional[str] = None,
+    ) -> RoleResult:
+        """
+        Menjalankan role berdasarkan RoutingDecision.
+        """
+
+        if not isinstance(
+            decision,
+            RoutingDecision,
+        ):
+            raise TypeError(
+                "decision harus RoutingDecision."
+            )
+
+        role = get_role(
+            decision.role
+        )
+
+        prompt = self.build_prompt(
+            role,
+            task,
+            context=context,
+            previous_result=previous_result,
+        )
+
+        response = self.adapter.generate(
+            prompt,
+            model=model,
+        )
+
+        return RoleResult(
+            role=role.name,
+            text=response.text,
+            confidence=decision.confidence,
+            metadata={
+                "provider": response.provider,
+                "model": response.model,
+            },
+        )
+
+    # --------------------------------------------------------
+    # EXECUTE BY TASK
+    # --------------------------------------------------------
+
+    def execute_task(
+        self,
+        task: str,
+        *,
+        context: str = "",
+        previous_result: str = "",
+        model: Optional[str] = None,
+    ) -> RoleResult:
+        """
+        Route task kemudian menjalankan role yang dipilih.
+        """
+
+        from .router import IntelligenceRouter
+
+        router = IntelligenceRouter()
+
+        decision = router.route(
+            task
+        )
+
+        return self.execute(
+            decision,
+            task,
+            context=context,
+            previous_result=previous_result,
+            model=model,
+        )
+
+
+# ============================================================
+# OUTPUT HELPERS
+# ============================================================
+
+
+def clean_role_text(text: str) -> str:
+    """
+    Membersihkan response role tanpa mengubah makna.
+    """
+
+    if not isinstance(text, str):
+        return ""
+
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = re.sub(
+            r"^```[a-zA-Z0-9_-]*\s*",
+            "",
+            text,
+        )
+
+        text = re.sub(
+            r"\s*```$",
+            "",
+            text,
+        )
+
+    return text.strip()
+
+
+def parse_json_result(
+    text: str,
+) -> dict[str, Any]:
+    """
+    Mencoba membaca JSON object dari output role.
+
+    Tidak memaksa Gemini menghasilkan JSON.
+    Fungsi ini hanya digunakan jika caller memang
+    mengharapkan structured output.
+    """
+
+    cleaned = clean_role_text(
+        text
+    )
+
+    if not cleaned:
+        raise ValueError(
+            "Role response kosong."
+        )
+
+    try:
+        value = json.loads(
+            cleaned
+        )
+
+    except json.JSONDecodeError:
+        match = re.search(
+            r"\{.*\}",
+            cleaned,
+            flags=re.DOTALL,
+        )
+
+        if not match:
+            raise ValueError(
+                "Role response bukan JSON valid."
+            )
+
+        try:
+            value = json.loads(
+                match.group(0)
+            )
+
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "JSON role tidak valid."
+            ) from error
+
+    if not isinstance(
+        value,
+        dict,
+    ):
+        raise ValueError(
+            "Role JSON harus object."
+        )
+
+    return value
+
+
+__all__ = [
+    "RoleResult",
+    "RoleEngine",
+    "clean_role_text",
+    "parse_json_result",
+]

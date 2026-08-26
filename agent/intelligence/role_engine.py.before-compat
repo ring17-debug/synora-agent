@@ -1,0 +1,438 @@
+"""
+Synora Role Engine V2.
+
+Tugas:
+- memilih dan menjalankan role agent;
+- menggunakan GeminiAdapter sebagai provider;
+- membuat prompt berdasarkan role;
+- meneruskan context dan hasil sebelumnya;
+- menghasilkan hasil terstruktur;
+- tidak pernah mengekspos API key.
+
+RoleEngine adalah execution layer untuk satu role.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from .gemini_adapter import GeminiAdapter
+from .roles import AgentRole
+
+
+# ============================================================
+# RESULT
+# ============================================================
+
+@dataclass(frozen=True)
+class RoleExecutionResult:
+    """
+    Hasil eksekusi satu role.
+    """
+
+    role: str
+    success: bool
+    output: str
+    error: str | None = None
+    metadata: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "success": self.success,
+            "output": self.output,
+            "error": self.error,
+            "metadata": dict(self.metadata),
+        }
+
+
+# ============================================================
+# ENGINE
+# ============================================================
+
+class RoleEngine:
+    """
+    Menjalankan satu AgentRole melalui GeminiAdapter.
+
+    API key tidak dikelola oleh RoleEngine.
+    Semua credential/provider handling dilakukan
+    oleh GeminiAdapter.
+    """
+
+    def __init__(
+        self,
+        adapter: GeminiAdapter,
+    ) -> None:
+
+        if adapter is None:
+            raise ValueError(
+                "GeminiAdapter wajib diberikan."
+            )
+
+        self.adapter = adapter
+
+    # ========================================================
+    # PROMPT
+    # ========================================================
+
+    @staticmethod
+    def build_prompt(
+        role: AgentRole,
+        task: str,
+        context: str = "",
+        previous_result: str = "",
+    ) -> str:
+        """
+        Membuat prompt terstruktur untuk role.
+        """
+
+        if not isinstance(task, str):
+            raise TypeError(
+                "task harus string."
+            )
+
+        task = task.strip()
+
+        if not task:
+            raise ValueError(
+                "task tidak boleh kosong."
+            )
+
+        role_name = getattr(
+            role,
+            "value",
+            str(role),
+        )
+
+        role_name = str(
+            role_name
+        ).strip().lower()
+
+        role_instructions = {
+            "planner": (
+                "Analisis task dan buat rencana implementasi "
+                "yang konkret. Identifikasi file yang relevan, "
+                "perubahan yang diperlukan, risiko, dan urutan kerja."
+            ),
+            "coder": (
+                "Implementasikan perubahan kode yang diperlukan. "
+                "Gunakan source code dan context yang tersedia. "
+                "Jangan mengarang API atau file yang tidak ada."
+            ),
+            "reviewer": (
+                "Review hasil pekerjaan secara kritis. "
+                "Cari bug, regression, security issue, "
+                "incorrect assumption, dan masalah correctness."
+            ),
+            "tester": (
+                "Validasi hasil implementasi. "
+                "Tentukan test yang relevan dan evaluasi "
+                "apakah perubahan benar-benar bekerja."
+            ),
+            "debugger": (
+                "Analisis kegagalan atau error secara sistematis. "
+                "Temukan root cause dan tentukan perbaikan yang tepat."
+            ),
+        }
+
+        instruction = role_instructions.get(
+            role_name,
+            (
+                "Kerjakan task sesuai tanggung jawab role "
+                "secara aman dan akurat."
+            ),
+        )
+
+        sections = [
+            "SYNORA ROLE EXECUTION",
+            "",
+            f"ROLE: {role_name}",
+            "",
+            "ROLE INSTRUCTION:",
+            instruction,
+            "",
+            "TASK:",
+            task,
+        ]
+
+        if context.strip():
+            sections.extend(
+                [
+                    "",
+                    "PROJECT CONTEXT:",
+                    context.strip(),
+                ]
+            )
+
+        if previous_result.strip():
+            sections.extend(
+                [
+                    "",
+                    "PREVIOUS ROLE RESULT:",
+                    previous_result.strip(),
+                ]
+            )
+
+        sections.extend(
+            [
+                "",
+                "EXECUTION RULES:",
+                "- Gunakan hanya informasi yang tersedia.",
+                "- Jangan mengarang file atau API.",
+                "- Jika informasi tidak cukup, nyatakan dengan jelas.",
+                "- Jangan menampilkan API key atau secret.",
+                "- Fokus pada task yang diberikan.",
+                "",
+                "RETURN:",
+                "Berikan hasil kerja yang konkret dan dapat "
+                "diteruskan ke role berikutnya.",
+            ]
+        )
+
+        return "\n".join(sections)
+
+    # ========================================================
+    # GEMINI CALL
+    # ========================================================
+
+    def _generate(
+        self,
+        prompt: str,
+    ) -> str:
+        """
+        Compatibility layer untuk beberapa bentuk GeminiAdapter.
+        """
+
+        candidates = (
+            "generate",
+            "generate_text",
+            "complete",
+            "chat",
+            "ask",
+        )
+
+        for method_name in candidates:
+
+            method = getattr(
+                self.adapter,
+                method_name,
+                None,
+            )
+
+            if not callable(method):
+                continue
+
+            try:
+                result = method(
+                    prompt
+                )
+            except TypeError:
+
+                try:
+                    result = method(
+                        prompt=prompt
+                    )
+                except TypeError:
+                    continue
+
+            if result is None:
+                return ""
+
+            if isinstance(
+                result,
+                str,
+            ):
+                return result.strip()
+
+            if hasattr(
+                result,
+                "text",
+            ):
+
+                text = getattr(
+                    result,
+                    "text",
+                )
+
+                if text is not None:
+                    return str(
+                        text
+                    ).strip()
+
+            if isinstance(
+                result,
+                dict,
+            ):
+
+                for key in (
+                    "text",
+                    "output",
+                    "content",
+                    "response",
+                ):
+
+                    value = result.get(
+                        key
+                    )
+
+                    if value is not None:
+                        return str(
+                            value
+                        ).strip()
+
+            return str(
+                result
+            ).strip()
+
+        raise RuntimeError(
+            "GeminiAdapter tidak memiliki "
+            "method generate yang kompatibel."
+        )
+
+    # ========================================================
+    # RUN
+    # ========================================================
+
+    def run(
+        self,
+        *,
+        role: AgentRole | str,
+        task: str,
+        context: str = "",
+        previous_result: str = "",
+    ) -> RoleExecutionResult:
+        """
+        Menjalankan satu role.
+
+        Signature dibuat keyword-friendly agar kompatibel
+        dengan AgentRuntime.
+        """
+
+        role_name = getattr(
+            role,
+            "value",
+            str(role),
+        )
+
+        role_name = str(
+            role_name
+        ).strip().lower()
+
+        if not role_name:
+            return RoleExecutionResult(
+                role="unknown",
+                success=False,
+                output="",
+                error="Role tidak valid.",
+            )
+
+        try:
+
+            prompt = self.build_prompt(
+                role=role,
+                task=task,
+                context=context,
+                previous_result=previous_result,
+            )
+
+            output = self._generate(
+                prompt
+            )
+
+            if not output:
+                return RoleExecutionResult(
+                    role=role_name,
+                    success=False,
+                    output="",
+                    error=(
+                        "Gemini mengembalikan "
+                        "output kosong."
+                    ),
+                )
+
+            return RoleExecutionResult(
+                role=role_name,
+                success=True,
+                output=output,
+                metadata={
+                    "provider": "gemini",
+                    "prompt_generated": True,
+                },
+            )
+
+        except Exception as error:
+
+            # Jangan pernah memasukkan credential
+            # ke dalam error yang diteruskan.
+            error_text = str(error)
+
+            lowered = error_text.lower()
+
+            for sensitive in (
+                "api_key",
+                "apikey",
+                "authorization",
+                "bearer",
+                "secret",
+                "password",
+                "token",
+            ):
+                if sensitive in lowered:
+                    error_text = (
+                        "Gemini provider mengalami "
+                        "authentication/provider error."
+                    )
+                    break
+
+            return RoleExecutionResult(
+                role=role_name,
+                success=False,
+                output="",
+                error=error_text,
+                metadata={
+                    "provider": "gemini",
+                },
+            )
+
+
+# ============================================================
+# FACTORY
+# ============================================================
+
+def create_role_engine(
+    adapter: GeminiAdapter | None = None,
+) -> RoleEngine:
+
+    if adapter is None:
+        from .gemini_adapter import (
+            create_gemini_adapter,
+        )
+
+        adapter = create_gemini_adapter()
+
+    return RoleEngine(
+        adapter=adapter
+    )
+
+
+__all__ = [
+    "RoleExecutionResult",
+    "RoleEngine",
+    "create_role_engine",
+]
+
+# ============================================================
+# BACKWARD COMPATIBILITY
+# ============================================================
+#
+# AgentRuntime / public API versi sebelumnya menggunakan
+# nama RoleResult. Implementasi V2 menggunakan
+# RoleExecutionResult.
+#
+# Alias ini menjaga compatibility tanpa membuat dua
+# implementation result yang berbeda.
+
+RoleResult = RoleExecutionResult
