@@ -77,6 +77,18 @@ from .agent_runtime import (
 )
 
 
+from .verification_engine import (
+    VerificationCheck,
+    VerificationResult,
+    VerificationEngine,
+    VERIFICATION_PENDING,
+    VERIFICATION_PASSED,
+    VERIFICATION_FAILED,
+    VERIFICATION_SKIPPED,
+    create_verification_engine,
+)
+
+
 # ============================================================
 # GLOBAL ROUTER
 # ============================================================
@@ -157,6 +169,16 @@ __all__ = [
     "ExecutionState",
     "ExecutionEngineV2",
     "create_execution_engine",
+
+    # Verification
+    "VerificationCheck",
+    "VerificationResult",
+    "VerificationEngine",
+    "VERIFICATION_PENDING",
+    "VERIFICATION_PASSED",
+    "VERIFICATION_FAILED",
+    "VERIFICATION_SKIPPED",
+    "create_verification_engine",
 
     # Context
     "ContextEngine",
