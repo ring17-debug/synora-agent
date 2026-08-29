@@ -437,6 +437,13 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
         }
 
         ("GET", "/mempool") => {
+            /*
+             * `transactions()` returns references to transactions.
+             * Calling `.iter()` therefore produces &&Transaction.
+             *
+             * Use a closure so the compiler performs the required
+             * dereference automatically.
+             */
             let transactions = node
                 .mempool()
                 .transactions()
@@ -676,6 +683,16 @@ fn node_error_response(error: &NodeError) -> (&'static str, u16) {
 
         NodeError::Consensus(_) => ("CONSENSUS_ERROR", 400),
 
+        /*
+         * A consensus commit requires the block itself.
+         *
+         * These are node-level validation errors rather than consensus
+         * engine errors, so expose stable RPC error codes for them.
+         */
+        NodeError::ConsensusBlockRequired => ("CONSENSUS_BLOCK_REQUIRED", 400),
+
+        NodeError::ConsensusBlockHashMismatch => ("CONSENSUS_BLOCK_HASH_MISMATCH", 400),
+
         NodeError::NoTransactions => ("NO_TRANSACTIONS", 400),
 
         NodeError::BlockGasLimitExceeded => ("BLOCK_GAS_LIMIT_EXCEEDED", 400),
@@ -745,6 +762,11 @@ fn block_to_json(block: &Block) -> BlockResponse {
         state_root: encode_hex(&block.header.state_root),
         transactions_root: encode_hex(&block.header.transactions_root),
         transaction_count: block.transactions.len(),
+
+        /*
+         * Here `.iter()` yields &Transaction directly, so the function
+         * can be passed without an additional closure.
+         */
         transactions: block.transactions.iter().map(transaction_to_json).collect(),
     }
 }
