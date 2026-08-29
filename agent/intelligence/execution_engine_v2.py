@@ -51,6 +51,7 @@ class AgentExecutionResult:
     output: str = ""
     error: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    structured: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -248,10 +249,6 @@ class ExecutionEngineV2:
     ) -> bool:
         """
         Menghapus handler role.
-
-        Return:
-            True jika role ada.
-            False jika tidak ada.
         """
 
         if not isinstance(
@@ -404,6 +401,7 @@ class ExecutionEngineV2:
             "error",
             "success",
             "status",
+            "structured",
         ):
             try:
                 value = getattr(
@@ -418,6 +416,65 @@ class ExecutionEngineV2:
                 result[key] = value
 
         return result or None
+
+    # ========================================================
+    # UNWRAP STRUCTURED RESULT
+    # ========================================================
+
+    @staticmethod
+    def _unwrap_structured_output(
+        structured: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """
+        Mengambil structured payload dari result envelope.
+
+        RoleExecutionResult biasanya menghasilkan:
+
+            {
+                "role": "...",
+                "status": "success",
+                "output": "...",
+                "metadata": {...},
+                "structured": {
+                    "plan": "...",
+                    "changes": [...],
+                    "verification": {...},
+                }
+            }
+
+        Engine harus membaca payload structured tersebut,
+        tetapi tetap mempertahankan envelope untuk metadata/error.
+        """
+
+        if not structured:
+            return structured
+
+        nested = structured.get(
+            "structured"
+        )
+
+        if not isinstance(
+            nested,
+            dict,
+        ):
+            return structured
+
+        merged = dict(nested)
+
+        # Preserve envelope-level fields when they are not
+        # already present in the structured payload.
+        for key in (
+            "output",
+            "error",
+            "success",
+            "status",
+            "metadata",
+            "role",
+        ):
+            if key not in merged and key in structured:
+                merged[key] = structured[key]
+
+        return merged
 
     # ========================================================
     # METADATA
@@ -519,9 +576,41 @@ class ExecutionEngineV2:
         state: ExecutionState,
         role: str,
         output: Any,
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """
+        Apply hasil role ke ExecutionState.
 
-        structured = cls._coerce_structured_output(
+        Return:
+
+            (
+                output_text,
+                metadata,
+                structured_payload,
+            )
+
+        Mendukung dua bentuk:
+
+        Legacy:
+
+            {
+                "plan": "...",
+                "changes": [...],
+                "verification": {...}
+            }
+
+        Structured envelope:
+
+            {
+                "output": "...",
+                "structured": {
+                    "plan": "...",
+                    "changes": [...],
+                    "verification": {...}
+                }
+            }
+        """
+
+        envelope = cls._coerce_structured_output(
             output
         )
 
@@ -529,7 +618,7 @@ class ExecutionEngineV2:
         # PLAIN OUTPUT
         # ----------------------------------------------------
 
-        if structured is None:
+        if envelope is None:
 
             text = cls._normalize_output(
                 output
@@ -542,15 +631,30 @@ class ExecutionEngineV2:
             return (
                 text,
                 {},
+                {},
             )
+
+        # ----------------------------------------------------
+        # UNWRAP NESTED STRUCTURED PAYLOAD
+        # ----------------------------------------------------
+
+        structured = cls._unwrap_structured_output(
+            envelope
+        )
+
+        if structured is None:
+            structured = {}
 
         # ----------------------------------------------------
         # OUTPUT
         # ----------------------------------------------------
 
-        text = structured.get(
+        text = envelope.get(
             "output",
-            "",
+            structured.get(
+                "output",
+                "",
+            ),
         )
 
         if text is None:
@@ -631,8 +735,13 @@ class ExecutionEngineV2:
         # ----------------------------------------------------
 
         metadata = cls._extract_metadata(
-            structured
+            envelope
         )
+
+        if not metadata:
+            metadata = cls._extract_metadata(
+                structured
+            )
 
         if metadata:
             state.metadata.update(
@@ -648,6 +757,7 @@ class ExecutionEngineV2:
                 text
             ),
             metadata,
+            structured,
         )
 
     # ========================================================
@@ -775,9 +885,15 @@ class ExecutionEngineV2:
                 context
             )
 
-            structured = (
+            envelope = (
                 self._coerce_structured_output(
                     output
+                )
+            )
+
+            structured = (
+                self._unwrap_structured_output(
+                    envelope
                 )
             )
 
@@ -799,7 +915,7 @@ class ExecutionEngineV2:
                 )
             )
 
-            text, metadata = (
+            text, metadata, structured_payload = (
                 self._apply_output(
                     state,
                     role,
@@ -822,6 +938,7 @@ class ExecutionEngineV2:
                         or "Agent melaporkan kegagalan."
                     ),
                     metadata=metadata,
+                    structured=structured_payload,
                 )
 
                 state.add_result(result)
@@ -858,6 +975,7 @@ class ExecutionEngineV2:
                         )
                     ),
                     metadata=metadata,
+                    structured=structured_payload,
                 )
 
                 state.add_result(result)
@@ -882,6 +1000,7 @@ class ExecutionEngineV2:
                 status=STATUS_SUCCESS,
                 output=text,
                 metadata=metadata,
+                structured=structured_payload,
             )
 
             state.add_result(result)
