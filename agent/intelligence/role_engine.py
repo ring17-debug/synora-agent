@@ -1,5 +1,5 @@
 """
-Synora Role Engine V2.2.
+Synora Role Engine V2.3.
 
 Role definition menggunakan roles.py sebagai single source of truth.
 """
@@ -139,15 +139,28 @@ class RoleExecutionResult:
     metadata: dict[str, Any] = field(
         default_factory=dict
     )
+    structured: dict[str, Any] | list[Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "role": self.role,
             "success": self.success,
             "output": self.output,
             "error": self.error,
             "metadata": dict(self.metadata),
         }
+
+        if self.structured is not None:
+            if isinstance(self.structured, dict):
+                data["structured"] = dict(
+                    self.structured
+                )
+            elif isinstance(self.structured, list):
+                data["structured"] = list(
+                    self.structured
+                )
+
+        return data
 
 
 RoleResult = RoleExecutionResult
@@ -504,6 +517,7 @@ class RoleEngine:
                 role=role_name,
                 success=True,
                 output=output,
+                structured=parsed_json,
                 metadata={
                     "provider": "gemini",
                     "role_resolved": True,

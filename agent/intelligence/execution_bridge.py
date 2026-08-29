@@ -1,5 +1,5 @@
 """
-Synora Execution Bridge V1.
+Synora Execution Bridge V1.1.
 
 Bridge antara:
     ExecutionEngineV2
@@ -10,7 +10,7 @@ Bridge antara:
 
 ExecutionEngineV2 tetap provider-agnostic.
 RoleEngine menangani role dan provider.
-Bridge hanya menerjemahkan execution context/result.
+Bridge meneruskan structured result dari RoleEngine.
 
 Tidak menyimpan API key.
 """
@@ -163,11 +163,12 @@ class RoleExecutionBridge:
         result: RoleExecutionResult,
     ) -> dict[str, Any]:
         """
-        Mengubah RoleExecutionResult menjadi structured output
+        Mengubah RoleExecutionResult menjadi output terstruktur
         yang dapat diproses ExecutionEngineV2.
         """
 
         data: dict[str, Any] = {
+            "role": result.role,
             "output": result.output,
             "success": result.success,
             "metadata": dict(
@@ -177,6 +178,16 @@ class RoleExecutionBridge:
 
         if result.error:
             data["error"] = result.error
+
+        if result.structured is not None:
+            if isinstance(result.structured, dict):
+                data["structured"] = dict(
+                    result.structured
+                )
+            elif isinstance(result.structured, list):
+                data["structured"] = list(
+                    result.structured
+                )
 
         return data
 
