@@ -479,20 +479,40 @@ mod tests {
     #[test]
     fn consensus_proposal_is_accepted_for_current_height() {
         let config = NodeConfig::devnet();
-
         let mut node = SynoraNode::new(config, 1_700_000_000);
 
-        let block = Block::genesis(1337, 1_700_000_100);
+        /*
+         * The chain starts with genesis at height 0.
+         * The first consensus height is therefore 1.
+         *
+         * With three validators and the current round-robin proposer
+         * formula, validator 2 is the proposer for height 1, round 0:
+         *
+         *     (1 + 0) % 3 = 1
+         */
+        let block = Block::new(
+            1337,
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            Vec::new(),
+        );
 
         /*
-         * At height 0, validator 1 is the proposer for round 0.
+         * Validator 2 is the deterministic proposer for height 1,
+         * round 0.
          */
-        node.submit_consensus_proposal(&block, 0)
+        let proposal = BlockProposal::new(&block, 0, [2u8; 20]);
+
+        node.consensus_mut()
+            .submit_proposal(proposal)
             .expect("proposal should be accepted");
 
         assert_eq!(node.consensus_phase(), ConsensusPhase::Prevote);
-        assert_eq!(node.consensus_proposal().unwrap().proposer, [1u8; 20]);
-        assert_eq!(node.consensus_proposal().unwrap().height, 0);
+        assert_eq!(node.consensus_proposal().unwrap().proposer, [2u8; 20]);
+        assert_eq!(node.consensus_proposal().unwrap().height, 1);
     }
 
     #[test]
@@ -501,6 +521,10 @@ mod tests {
 
         let mut node = SynoraNode::new(config, 1_700_000_000);
 
+        /*
+         * Genesis is height 0 while the consensus engine expects height 1.
+         * This test intentionally verifies that mismatch is rejected.
+         */
         let block = Block::genesis(1337, 1_700_000_100);
 
         let result = node.submit_consensus_proposal(&block, 0);
@@ -537,7 +561,15 @@ mod tests {
          *
          *     (1 + 0) % 3 = 1
          */
-        let mut proposal_block = Block::genesis(1337, 1_700_000_100);
+        let proposal_block = Block::new(
+            1337,
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            Vec::new(),
+        );
 
         /*
          * The engine requires validator 2 to be the proposer, so use
@@ -561,13 +593,6 @@ mod tests {
         );
 
         assert_eq!(node.consensus_phase(), ConsensusPhase::Precommit);
-
-        /*
-         * Avoid an unused mut warning while keeping the block explicit
-         * for the test's purpose.
-         */
-        proposal_block = Block::genesis(1337, 1_700_000_100);
-        assert_eq!(proposal_block.header.height, 0);
     }
 
     #[test]
@@ -580,7 +605,15 @@ mod tests {
          * The first consensus height is 1, therefore validator 2
          * is the proposer at round 0.
          */
-        let block = Block::genesis(1337, 1_700_000_100);
+        let block = Block::new(
+            1337,
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            Vec::new(),
+        );
 
         let proposal = BlockProposal::new(&block, 0, [2u8; 20]);
 

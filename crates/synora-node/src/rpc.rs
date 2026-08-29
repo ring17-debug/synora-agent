@@ -674,6 +674,8 @@ fn node_error_response(error: &NodeError) -> (&'static str, u16) {
 
         NodeError::Chain(_) => ("CHAIN_ERROR", 400),
 
+        NodeError::Consensus(_) => ("CONSENSUS_ERROR", 400),
+
         NodeError::NoTransactions => ("NO_TRANSACTIONS", 400),
 
         NodeError::BlockGasLimitExceeded => ("BLOCK_GAS_LIMIT_EXCEEDED", 400),
