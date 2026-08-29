@@ -14,7 +14,7 @@ Tanggung jawab:
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
@@ -46,6 +46,11 @@ VerificationCheck = Callable[
 class VerificationResult:
     """
     Hasil verification pipeline.
+
+    Representasi internal menggunakan tuple agar immutable.
+    Ketika diekspor melalui to_dict(), collection dikonversi
+    menjadi list agar sesuai dengan ExecutionState contract
+    dan struktur JSON-friendly.
     """
 
     status: str
@@ -65,7 +70,41 @@ class VerificationResult:
     )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """
+        Convert verification result menjadi public state contract.
+
+        Collection sengaja dikonversi dari tuple -> list.
+
+        Ini penting karena state.verification merupakan data
+        runtime/public contract yang harus mudah dikonsumsi oleh:
+
+        - repair engine
+        - execution history
+        - context builder
+        - JSON serialization
+        - test/integration layer
+        """
+
+        return {
+            "status": self.status,
+            "passed": self.passed,
+            "required": self.required,
+            "checks": [
+                dict(check)
+                if isinstance(check, dict)
+                else check
+                for check in self.checks
+            ],
+            "evidence": list(
+                self.evidence
+            ),
+            "errors": list(
+                self.errors
+            ),
+            "metadata": dict(
+                self.metadata
+            ),
+        }
 
 
 # ============================================================
@@ -401,7 +440,6 @@ class VerificationEngine:
 
         if all_passed:
             status = VERIFICATION_PASSED
-
         else:
             status = VERIFICATION_FAILED
 

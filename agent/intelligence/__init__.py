@@ -76,7 +76,6 @@ from .agent_runtime import (
     create_agent_runtime,
 )
 
-
 from .verification_engine import (
     VerificationCheck,
     VerificationResult,
@@ -86,6 +85,11 @@ from .verification_engine import (
     VERIFICATION_FAILED,
     VERIFICATION_SKIPPED,
     create_verification_engine,
+)
+
+from .verified_execution_engine import (
+    VerifiedExecutionEngine,
+    create_verified_execution_engine,
 )
 
 
@@ -179,6 +183,10 @@ __all__ = [
     "VERIFICATION_FAILED",
     "VERIFICATION_SKIPPED",
     "create_verification_engine",
+
+    # Verified execution
+    "VerifiedExecutionEngine",
+    "create_verified_execution_engine",
 
     # Context
     "ContextEngine",
