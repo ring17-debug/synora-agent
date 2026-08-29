@@ -1,5 +1,5 @@
 """
-Synora Decision Engine V1.
+Synora Decision Engine V2.1.
 
 Tugas:
 - menentukan langkah agent berikutnya;
@@ -21,6 +21,7 @@ from typing import Any, Iterable, Optional
 # ============================================================
 # DECISION
 # ============================================================
+
 
 @dataclass(frozen=True)
 class AgentDecision:
@@ -74,6 +75,7 @@ class AgentDecision:
 # ACTIONS
 # ============================================================
 
+
 ACTION_PLAN = "plan"
 ACTION_CODE = "code"
 ACTION_REVIEW = "review"
@@ -100,9 +102,10 @@ VALID_ACTIONS = {
 # ENGINE
 # ============================================================
 
+
 class DecisionEngine:
     """
-    Decision Engine V1.
+    Decision Engine V2.1.
 
     Engine ini bersifat deterministic terlebih dahulu.
 
@@ -161,6 +164,13 @@ class DecisionEngine:
     def _normalize_role(
         role: Optional[str],
     ) -> Optional[str]:
+        """
+        Normalisasi nama role.
+
+        Contoh:
+            " Planner " -> "planner"
+            None        -> None
+        """
 
         if role is None:
             return None
@@ -174,6 +184,48 @@ class DecisionEngine:
             return None
 
         return role
+
+    @staticmethod
+    def _extract_pipeline_role(
+        item: Any,
+    ) -> Optional[str]:
+        """
+        Mengambil role dari satu pipeline item.
+
+        Pipeline mendukung dua bentuk:
+
+            [
+                "planner",
+                "coder",
+                "reviewer",
+            ]
+
+        atau:
+
+            [
+                object(role="planner"),
+                object(role="coder"),
+            ]
+
+        Ini menjaga compatibility dengan execution
+        engine yang mungkin menggunakan object sebagai
+        pipeline step.
+        """
+
+        if isinstance(item, str):
+            return DecisionEngine._normalize_role(
+                item
+            )
+
+        role = getattr(
+            item,
+            "role",
+            None,
+        )
+
+        return DecisionEngine._normalize_role(
+            role
+        )
 
     @staticmethod
     def _normalize_confidence(
@@ -282,12 +334,14 @@ class DecisionEngine:
         Priority:
 
         1. invalid task -> abort
-        2. pipeline complete -> finish
-        3. verification failure -> debug/repair
-        4. reviewer rejection -> coder
-        5. tester rejection -> debugger
-        6. role transition
-        7. fallback -> planner
+        2. repair limit -> abort
+        3. pipeline complete -> finish
+        4. verification failure -> debug
+        5. reviewer rejection -> repair/coder
+        6. tester rejection -> debug/debugger
+        7. role transition
+        8. status failure -> debugger
+        9. fallback -> planner
         """
 
         # ----------------------------------------------------
@@ -403,7 +457,8 @@ class DecisionEngine:
         # ----------------------------------------------------
 
         if (
-            current_role == "reviewer"
+            self._normalize_role(current_role)
+            == "reviewer"
             and not reviewer_approved
         ):
             return AgentDecision(
@@ -426,7 +481,8 @@ class DecisionEngine:
         # ----------------------------------------------------
 
         if (
-            current_role == "tester"
+            self._normalize_role(current_role)
+            == "tester"
             and not tester_approved
         ):
             return AgentDecision(
@@ -524,7 +580,16 @@ class DecisionEngine:
         # STATUS-BASED FALLBACK
         # ----------------------------------------------------
 
-        if current_status in {
+        normalized_status = (
+            current_status.strip().lower()
+            if isinstance(
+                current_status,
+                str,
+            )
+            else ""
+        )
+
+        if normalized_status in {
             "failed",
             "error",
             "failure",
@@ -569,6 +634,21 @@ class DecisionEngine:
         awal execution.
         """
 
+        if not isinstance(
+            task,
+            str,
+        ) or not task.strip():
+            return AgentDecision(
+                action=ACTION_ABORT,
+                next_role=None,
+                should_continue=False,
+                confidence=0.99,
+                reason=(
+                    "Task kosong atau tidak valid; "
+                    "routing dihentikan."
+                ),
+            )
+
         role = self._normalize_role(
             getattr(
                 routing_decision,
@@ -590,6 +670,12 @@ class DecisionEngine:
             "reason",
             "Routing selesai.",
         )
+
+        if not isinstance(
+            reason,
+            str,
+        ):
+            reason = str(reason)
 
         if role not in self.ROLE_TO_ACTION:
             return AgentDecision(
@@ -698,14 +784,56 @@ class DecisionEngine:
     ) -> AgentDecision:
         """
         Menentukan langkah berikutnya berdasarkan pipeline.
+
+        Pipeline dapat berupa:
+
+            [
+                "planner",
+                "coder",
+                "reviewer",
+                "tester",
+            ]
+
+        maupun object yang memiliki attribute ``role``.
         """
+
+        # ----------------------------------------------------
+        # PIPELINE VALIDATION
+        # ----------------------------------------------------
+
+        if pipeline is None:
+            return AgentDecision(
+                action=ACTION_FINISH,
+                next_role=None,
+                should_continue=False,
+                confidence=0.99,
+                reason=(
+                    "Pipeline tidak tersedia."
+                ),
+            )
 
         items = list(pipeline)
 
-        if index < 0:
-            index = 0
+        # ----------------------------------------------------
+        # INDEX NORMALIZATION
+        # ----------------------------------------------------
 
-        if index >= len(items):
+        try:
+            normalized_index = int(index)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            normalized_index = 0
+
+        if normalized_index < 0:
+            normalized_index = 0
+
+        # ----------------------------------------------------
+        # PIPELINE EXHAUSTED
+        # ----------------------------------------------------
+
+        if normalized_index >= len(items):
             return AgentDecision(
                 action=ACTION_FINISH,
                 next_role=None,
@@ -714,36 +842,72 @@ class DecisionEngine:
                 reason=(
                     "Semua pipeline step telah selesai."
                 ),
+                metadata={
+                    "pipeline_index": normalized_index,
+                    "pipeline_size": len(items),
+                },
             )
+
+        # ----------------------------------------------------
+        # VERIFICATION
+        # ----------------------------------------------------
 
         if self._verification_failed(
             verification
         ):
+            current_role = (
+                self._extract_pipeline_role(
+                    items[normalized_index]
+                )
+            )
+
             return self.decide(
                 task="pipeline verification",
-                current_role=getattr(
-                    items[index],
-                    "role",
-                    None,
-                ),
+                current_role=current_role,
                 verification=verification,
                 repair_round=repair_round,
             )
 
-        item = items[index]
+        # ----------------------------------------------------
+        # CURRENT PIPELINE STEP
+        # ----------------------------------------------------
 
-        role = self._normalize_role(
-            getattr(
-                item,
-                "role",
-                None,
+        item = items[normalized_index]
+
+        role = self._extract_pipeline_role(
+            item
+        )
+
+        # ----------------------------------------------------
+        # UNKNOWN ROLE
+        # ----------------------------------------------------
+
+        if role not in self.ROLE_TO_ACTION:
+            return AgentDecision(
+                action=ACTION_PLAN,
+                next_role="planner",
+                should_continue=True,
+                confidence=0.80,
+                reason=(
+                    f"Pipeline step "
+                    f"{normalized_index + 1} "
+                    "memiliki role tidak dikenal; "
+                    "fallback ke planner."
+                ),
+                metadata={
+                    "pipeline_index": normalized_index,
+                    "pipeline_size": len(items),
+                    "original_role": role,
+                },
             )
-        )
 
-        action = self.ROLE_TO_ACTION.get(
-            role,
-            ACTION_PLAN,
-        )
+        # ----------------------------------------------------
+        # NORMAL PIPELINE STEP
+        # ----------------------------------------------------
+
+        action = self.ROLE_TO_ACTION[
+            role
+        ]
 
         return AgentDecision(
             action=action,
@@ -751,11 +915,12 @@ class DecisionEngine:
             should_continue=True,
             confidence=0.95,
             reason=(
-                f"Pipeline step {index + 1} "
+                f"Pipeline step "
+                f"{normalized_index + 1} "
                 f"menggunakan role {role}."
             ),
             metadata={
-                "pipeline_index": index,
+                "pipeline_index": normalized_index,
                 "pipeline_size": len(items),
             },
         )
@@ -765,29 +930,24 @@ class DecisionEngine:
 # FACTORY
 # ============================================================
 
+
 def create_decision_engine(
     *,
-    max_repair_rounds: int = (
-        DecisionEngine.MAX_REPAIR_ROUNDS
-    ),
+    max_repair_rounds: int = DecisionEngine.MAX_REPAIR_ROUNDS,
 ) -> DecisionEngine:
     """
-    Factory Decision Engine.
+    Factory untuk membuat DecisionEngine.
     """
 
     return DecisionEngine(
-        max_repair_rounds=max_repair_rounds,
+        max_repair_rounds=max_repair_rounds
     )
 
-
-# ============================================================
-# PUBLIC API
-# ============================================================
 
 __all__ = [
     "AgentDecision",
     "DecisionEngine",
-    "create_decision_engine",
+    "VALID_ACTIONS",
     "ACTION_PLAN",
     "ACTION_CODE",
     "ACTION_REVIEW",
@@ -796,5 +956,5 @@ __all__ = [
     "ACTION_REPAIR",
     "ACTION_FINISH",
     "ACTION_ABORT",
-    "VALID_ACTIONS",
+    "create_decision_engine",
 ]

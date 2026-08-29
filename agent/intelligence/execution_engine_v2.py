@@ -1,16 +1,19 @@
 """
-Synora Execution Engine V2.
+Synora Execution Engine V2.2.
 
 State-aware execution layer untuk multi-agent pipeline.
 
-Fungsi utama:
-- menjalankan role secara berurutan
-- membawa state antar-agent
-- menyimpan hasil setiap agent
-- mencatat execution history
-- mendukung retry/repair round
-- tidak membocorkan API key
-- tetap kompatibel dengan satu Gemini API key
+Fitur:
+- sequential multi-agent execution
+- state antar-role
+- structured result
+- plan / changes / verification propagation
+- execution history
+- repair cycle
+- handler registration
+- backward-compatible result normalization
+- safe serialization
+- tidak menyimpan credential/API key
 """
 
 from __future__ import annotations
@@ -40,16 +43,14 @@ MAX_REPAIR_ROUNDS = 2
 @dataclass
 class AgentExecutionResult:
     """
-    Hasil eksekusi satu agent.
+    Hasil eksekusi satu role.
     """
 
     role: str
     status: str
     output: str = ""
     error: str = ""
-    metadata: dict[str, Any] = field(
-        default_factory=dict
-    )
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -62,9 +63,9 @@ class AgentExecutionResult:
 @dataclass
 class ExecutionState:
     """
-    State global yang dibawa sepanjang pipeline.
+    State global pipeline.
 
-    State ini sengaja tidak menyimpan API key.
+    State ini tidak boleh menyimpan credential.
     """
 
     task: str
@@ -105,9 +106,9 @@ class ExecutionState:
         **data: Any,
     ) -> None:
         """
-        Menambahkan event execution.
+        Tambahkan event execution.
 
-        Jangan pernah memasukkan secret ke data.
+        Caller bertanggung jawab untuk tidak memasukkan secret.
         """
 
         self.history.append(
@@ -141,9 +142,7 @@ class ExecutionState:
 @dataclass(frozen=True)
 class AgentExecutionContext:
     """
-    Context read-only yang diberikan kepada agent.
-
-    Agent tidak menerima object internal engine secara langsung.
+    Context read-only yang diberikan kepada role handler.
     """
 
     task: str
@@ -155,7 +154,7 @@ class AgentExecutionContext:
     repair_round: int
     previous_results: tuple[
         AgentExecutionResult,
-        ...
+        ...,
     ]
 
 
@@ -175,26 +174,7 @@ AgentHandler = Callable[
 
 class ExecutionEngineV2:
     """
-    State-aware execution engine.
-
-    Contoh:
-
-        engine = ExecutionEngineV2()
-
-        engine.register(
-            "planner",
-            planner_handler,
-        )
-
-        engine.register(
-            "coder",
-            coder_handler,
-        )
-
-        state = engine.execute(
-            "buat endpoint RPC baru",
-            ["planner", "coder"],
-        )
+    State-aware multi-agent execution engine.
     """
 
     def __init__(
@@ -203,23 +183,29 @@ class ExecutionEngineV2:
         max_repair_rounds: int = MAX_REPAIR_ROUNDS,
     ) -> None:
 
+        if not isinstance(
+            max_repair_rounds,
+            int,
+        ):
+            raise TypeError(
+                "max_repair_rounds harus integer."
+            )
+
         if max_repair_rounds < 0:
             raise ValueError(
                 "max_repair_rounds tidak boleh negatif."
             )
 
-        self.max_repair_rounds = (
-            max_repair_rounds
-        )
+        self.max_repair_rounds = max_repair_rounds
 
         self.handlers: dict[
             str,
             AgentHandler,
         ] = {}
 
-    # --------------------------------------------------------
+    # ========================================================
     # REGISTER
-    # --------------------------------------------------------
+    # ========================================================
 
     def register(
         self,
@@ -227,17 +213,20 @@ class ExecutionEngineV2:
         handler: AgentHandler,
     ) -> None:
         """
-        Mendaftarkan handler untuk role.
+        Register handler untuk sebuah role.
         """
 
-        if not isinstance(role, str):
+        if not isinstance(
+            role,
+            str,
+        ):
             raise TypeError(
                 "role harus string."
             )
 
-        role = role.strip()
+        normalized = role.strip()
 
-        if not role:
+        if not normalized:
             raise ValueError(
                 "role tidak boleh kosong."
             )
@@ -247,11 +236,67 @@ class ExecutionEngineV2:
                 "handler harus callable."
             )
 
-        self.handlers[role] = handler
+        self.handlers[normalized] = handler
 
-    # --------------------------------------------------------
+    # ========================================================
+    # UNREGISTER
+    # ========================================================
+
+    def unregister(
+        self,
+        role: str,
+    ) -> bool:
+        """
+        Menghapus handler role.
+
+        Return:
+            True jika role ada.
+            False jika tidak ada.
+        """
+
+        if not isinstance(
+            role,
+            str,
+        ):
+            raise TypeError(
+                "role harus string."
+            )
+
+        normalized = role.strip()
+
+        if not normalized:
+            raise ValueError(
+                "role tidak boleh kosong."
+            )
+
+        return self.handlers.pop(
+            normalized,
+            None,
+        ) is not None
+
+    # ========================================================
+    # HAS HANDLER
+    # ========================================================
+
+    def has_handler(
+        self,
+        role: str,
+    ) -> bool:
+        """
+        Mengecek handler.
+        """
+
+        if not isinstance(
+            role,
+            str,
+        ):
+            return False
+
+        return role.strip() in self.handlers
+
+    # ========================================================
     # CONTEXT
-    # --------------------------------------------------------
+    # ========================================================
 
     @staticmethod
     def _build_context(
@@ -267,6 +312,7 @@ class ExecutionEngineV2:
             changes=tuple(
                 dict(item)
                 for item in state.changes
+                if isinstance(item, dict)
             ),
             verification=dict(
                 state.verification
@@ -277,123 +323,336 @@ class ExecutionEngineV2:
             ),
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # OUTPUT NORMALIZATION
-    # --------------------------------------------------------
+    # ========================================================
 
     @staticmethod
     def _normalize_output(
         output: Any,
     ) -> str:
         """
-        Normalisasi output agent menjadi string.
-
-        Dict/list tetap aman untuk engine,
-        tetapi representasi internal dibuat deterministic.
+        Normalisasi output menjadi string.
         """
 
         if output is None:
             return ""
 
-        if isinstance(output, str):
+        if isinstance(
+            output,
+            str,
+        ):
             return output
 
         return str(output)
 
-    # --------------------------------------------------------
-    # RESULT APPLICATION
-    # --------------------------------------------------------
+    # ========================================================
+    # STRUCTURED OUTPUT
+    # ========================================================
 
     @staticmethod
+    def _coerce_structured_output(
+        output: Any,
+    ) -> dict[str, Any] | None:
+        """
+        Normalisasi berbagai bentuk result menjadi dictionary.
+
+        Supported:
+
+        - dict
+        - object.to_dict()
+        - object dengan structured attributes
+        - string / primitive
+        """
+
+        if output is None:
+            return None
+
+        if isinstance(
+            output,
+            dict,
+        ):
+            return dict(output)
+
+        to_dict = getattr(
+            output,
+            "to_dict",
+            None,
+        )
+
+        if callable(to_dict):
+            try:
+                converted = to_dict()
+
+                if isinstance(
+                    converted,
+                    dict,
+                ):
+                    return dict(converted)
+
+            except Exception:
+                pass
+
+        result: dict[str, Any] = {}
+
+        for key in (
+            "output",
+            "plan",
+            "changes",
+            "verification",
+            "metadata",
+            "error",
+            "success",
+            "status",
+        ):
+            try:
+                value = getattr(
+                    output,
+                    key,
+                    None,
+                )
+            except Exception:
+                continue
+
+            if value is not None:
+                result[key] = value
+
+        return result or None
+
+    # ========================================================
+    # METADATA
+    # ========================================================
+
+    @staticmethod
+    def _extract_metadata(
+        structured: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+
+        if not structured:
+            return {}
+
+        metadata = structured.get(
+            "metadata"
+        )
+
+        if isinstance(
+            metadata,
+            dict,
+        ):
+            return dict(metadata)
+
+        return {}
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
+
+    @staticmethod
+    def _extract_success(
+        structured: dict[str, Any] | None,
+    ) -> Optional[bool]:
+
+        if not structured:
+            return None
+
+        value = structured.get(
+            "success"
+        )
+
+        if isinstance(
+            value,
+            bool,
+        ):
+            return value
+
+        return None
+
+    # ========================================================
+    # ERROR
+    # ========================================================
+
+    @staticmethod
+    def _extract_error(
+        structured: dict[str, Any] | None,
+    ) -> str:
+
+        if not structured:
+            return ""
+
+        value = structured.get(
+            "error"
+        )
+
+        if value is None:
+            return ""
+
+        return str(value)
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    @staticmethod
+    def _extract_status(
+        structured: dict[str, Any] | None,
+    ) -> str:
+
+        if not structured:
+            return ""
+
+        value = structured.get(
+            "status"
+        )
+
+        if value is None:
+            return ""
+
+        return str(value).strip().lower()
+
+    # ========================================================
+    # APPLY OUTPUT
+    # ========================================================
+
+    @classmethod
     def _apply_output(
+        cls,
         state: ExecutionState,
         role: str,
         output: Any,
-    ) -> str:
-        """
-        Terapkan output agent ke state.
+    ) -> tuple[str, dict[str, Any]]:
 
-        Handler boleh mengembalikan:
-
-        - string
-        - dict dengan field:
-          output
-          plan
-          changes
-          verification
-          metadata
-        """
-
-        if isinstance(output, dict):
-
-            text = output.get(
-                "output",
-                "",
-            )
-
-            if text is None:
-                text = ""
-
-            if "plan" in output:
-                plan = output["plan"]
-
-                if isinstance(
-                    plan,
-                    str,
-                ):
-                    state.plan = plan
-
-            if "changes" in output:
-                changes = output["changes"]
-
-                if isinstance(
-                    changes,
-                    list,
-                ):
-                    state.changes = [
-                        dict(item)
-                        for item in changes
-                        if isinstance(
-                            item,
-                            dict,
-                        )
-                    ]
-
-            if "verification" in output:
-                verification = (
-                    output["verification"]
-                )
-
-                if isinstance(
-                    verification,
-                    dict,
-                ):
-                    state.verification = dict(
-                        verification
-                    )
-
-            if "metadata" in output:
-                metadata = output["metadata"]
-
-                if isinstance(
-                    metadata,
-                    dict,
-                ):
-                    state.metadata.update(
-                        metadata
-                    )
-
-            return ExecutionEngineV2._normalize_output(
-                text
-            )
-
-        return ExecutionEngineV2._normalize_output(
+        structured = cls._coerce_structured_output(
             output
         )
 
-    # --------------------------------------------------------
-    # SINGLE AGENT
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # PLAIN OUTPUT
+        # ----------------------------------------------------
+
+        if structured is None:
+
+            text = cls._normalize_output(
+                output
+            )
+
+            state.metadata[
+                f"role_{role}_executed"
+            ] = True
+
+            return (
+                text,
+                {},
+            )
+
+        # ----------------------------------------------------
+        # OUTPUT
+        # ----------------------------------------------------
+
+        text = structured.get(
+            "output",
+            "",
+        )
+
+        if text is None:
+            text = ""
+
+        # ----------------------------------------------------
+        # PLAN
+        # ----------------------------------------------------
+
+        if "plan" in structured:
+
+            plan = structured.get(
+                "plan"
+            )
+
+            if isinstance(
+                plan,
+                str,
+            ):
+                state.plan = plan
+
+            elif plan is not None:
+                state.plan = str(plan)
+
+        # ----------------------------------------------------
+        # CHANGES
+        # ----------------------------------------------------
+
+        if "changes" in structured:
+
+            changes = structured.get(
+                "changes"
+            )
+
+            if isinstance(
+                changes,
+                list,
+            ):
+
+                normalized_changes: list[
+                    dict[str, Any]
+                ] = []
+
+                for item in changes:
+
+                    if isinstance(
+                        item,
+                        dict,
+                    ):
+                        normalized_changes.append(
+                            dict(item)
+                        )
+
+                state.changes = (
+                    normalized_changes
+                )
+
+        # ----------------------------------------------------
+        # VERIFICATION
+        # ----------------------------------------------------
+
+        if "verification" in structured:
+
+            verification = structured.get(
+                "verification"
+            )
+
+            if isinstance(
+                verification,
+                dict,
+            ):
+                state.verification = dict(
+                    verification
+                )
+
+        # ----------------------------------------------------
+        # METADATA
+        # ----------------------------------------------------
+
+        metadata = cls._extract_metadata(
+            structured
+        )
+
+        if metadata:
+            state.metadata.update(
+                metadata
+            )
+
+        state.metadata[
+            f"role_{role}_executed"
+        ] = True
+
+        return (
+            cls._normalize_output(
+                text
+            ),
+            metadata,
+        )
+
+    # ========================================================
+    # EXECUTE ROLE
+    # ========================================================
 
     def execute_role(
         self,
@@ -404,7 +663,69 @@ class ExecutionEngineV2:
         Jalankan satu role.
         """
 
-        if role not in self.handlers:
+        # ----------------------------------------------------
+        # INVALID ROLE TYPE
+        # ----------------------------------------------------
+
+        if not isinstance(
+            role,
+            str,
+        ):
+
+            result = AgentExecutionResult(
+                role="unknown",
+                status=STATUS_FAILED,
+                error="role harus string.",
+            )
+
+            state.add_result(result)
+
+            state.status = STATUS_FAILED
+
+            state.add_history(
+                "agent_failed",
+                role="unknown",
+                reason="invalid_role",
+            )
+
+            return result
+
+        # ----------------------------------------------------
+        # NORMALIZE ROLE
+        # ----------------------------------------------------
+
+        role = role.strip()
+
+        if not role:
+
+            result = AgentExecutionResult(
+                role="unknown",
+                status=STATUS_FAILED,
+                error="role tidak boleh kosong.",
+            )
+
+            state.add_result(result)
+
+            state.status = STATUS_FAILED
+
+            state.add_history(
+                "agent_failed",
+                role="unknown",
+                reason="empty_role",
+            )
+
+            return result
+
+        # ----------------------------------------------------
+        # HANDLER
+        # ----------------------------------------------------
+
+        handler = self.handlers.get(
+            role
+        )
+
+        if handler is None:
+
             result = AgentExecutionResult(
                 role=role,
                 status=STATUS_FAILED,
@@ -416,6 +737,8 @@ class ExecutionEngineV2:
 
             state.add_result(result)
 
+            state.status = STATUS_FAILED
+
             state.add_history(
                 "agent_failed",
                 role=role,
@@ -423,6 +746,10 @@ class ExecutionEngineV2:
             )
 
             return result
+
+        # ----------------------------------------------------
+        # START
+        # ----------------------------------------------------
 
         state.current_role = role
         state.status = STATUS_RUNNING
@@ -438,21 +765,123 @@ class ExecutionEngineV2:
             role,
         )
 
-        handler = self.handlers[role]
+        # ----------------------------------------------------
+        # EXECUTION
+        # ----------------------------------------------------
 
         try:
-            output = handler(context)
 
-            text = self._apply_output(
-                state,
-                role,
-                output,
+            output = handler(
+                context
             )
+
+            structured = (
+                self._coerce_structured_output(
+                    output
+                )
+            )
+
+            declared_success = (
+                self._extract_success(
+                    structured
+                )
+            )
+
+            declared_error = (
+                self._extract_error(
+                    structured
+                )
+            )
+
+            declared_status = (
+                self._extract_status(
+                    structured
+                )
+            )
+
+            text, metadata = (
+                self._apply_output(
+                    state,
+                    role,
+                    output,
+                )
+            )
+
+            # ------------------------------------------------
+            # EXPLICIT FAILURE
+            # ------------------------------------------------
+
+            if declared_success is False:
+
+                result = AgentExecutionResult(
+                    role=role,
+                    status=STATUS_FAILED,
+                    output=text,
+                    error=(
+                        declared_error
+                        or "Agent melaporkan kegagalan."
+                    ),
+                    metadata=metadata,
+                )
+
+                state.add_result(result)
+
+                state.status = STATUS_FAILED
+
+                state.add_history(
+                    "agent_failed",
+                    role=role,
+                    status=STATUS_FAILED,
+                    reason="agent_reported_failure",
+                )
+
+                return result
+
+            # ------------------------------------------------
+            # EXPLICIT FAILED STATUS
+            # ------------------------------------------------
+
+            if declared_status in {
+                STATUS_FAILED,
+                STATUS_ABORTED,
+            }:
+
+                result = AgentExecutionResult(
+                    role=role,
+                    status=STATUS_FAILED,
+                    output=text,
+                    error=(
+                        declared_error
+                        or (
+                            f"Role '{role}' "
+                            "mengembalikan status gagal."
+                        )
+                    ),
+                    metadata=metadata,
+                )
+
+                state.add_result(result)
+
+                state.status = STATUS_FAILED
+
+                state.add_history(
+                    "agent_failed",
+                    role=role,
+                    status=STATUS_FAILED,
+                    reason="agent_reported_status",
+                )
+
+                return result
+
+            # ------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------
 
             result = AgentExecutionResult(
                 role=role,
                 status=STATUS_SUCCESS,
                 output=text,
+                metadata=metadata,
             )
 
             state.add_result(result)
@@ -465,11 +894,18 @@ class ExecutionEngineV2:
 
             return result
 
+        # ----------------------------------------------------
+        # EXCEPTION
+        # ----------------------------------------------------
+
         except Exception as error:
+
+            error_text = str(error)
+
             result = AgentExecutionResult(
                 role=role,
                 status=STATUS_FAILED,
-                error=str(error),
+                error=error_text,
             )
 
             state.add_result(result)
@@ -480,14 +916,14 @@ class ExecutionEngineV2:
                 "agent_failed",
                 role=role,
                 status=STATUS_FAILED,
-                error=str(error),
+                error=error_text,
             )
 
             return result
 
-    # --------------------------------------------------------
+    # ========================================================
     # PIPELINE
-    # --------------------------------------------------------
+    # ========================================================
 
     def execute(
         self,
@@ -499,16 +935,11 @@ class ExecutionEngineV2:
     ) -> ExecutionState:
         """
         Menjalankan pipeline dari awal.
-
-        Pipeline contoh:
-
-            [
-                "planner",
-                "coder",
-                "reviewer",
-                "tester",
-            ]
         """
+
+        # ----------------------------------------------------
+        # VALIDATION
+        # ----------------------------------------------------
 
         if not isinstance(
             task,
@@ -518,7 +949,9 @@ class ExecutionEngineV2:
                 "task harus string."
             )
 
-        if not task.strip():
+        normalized_task = task.strip()
+
+        if not normalized_task:
             raise ValueError(
                 "task tidak boleh kosong."
             )
@@ -536,18 +969,69 @@ class ExecutionEngineV2:
                 "pipeline tidak boleh kosong."
             )
 
+        if repair_round < 0:
+            raise ValueError(
+                "repair_round tidak boleh negatif."
+            )
+
+        # ----------------------------------------------------
+        # NORMALIZE PIPELINE
+        # ----------------------------------------------------
+
+        normalized_pipeline: list[str] = []
+
+        for role in pipeline:
+
+            if not isinstance(
+                role,
+                str,
+            ):
+                raise TypeError(
+                    "setiap role dalam pipeline "
+                    "harus string."
+                )
+
+            normalized_role = role.strip()
+
+            if not normalized_role:
+                raise ValueError(
+                    "role pipeline tidak boleh kosong."
+                )
+
+            normalized_pipeline.append(
+                normalized_role
+            )
+
+        # ----------------------------------------------------
+        # STATE
+        # ----------------------------------------------------
+
         state = ExecutionState(
-            task=task.strip(),
-            context=context,
+            task=normalized_task,
+            context=(
+                context
+                if isinstance(
+                    context,
+                    str,
+                )
+                else str(context)
+            ),
             repair_round=repair_round,
         )
 
         state.add_history(
             "execution_started",
-            pipeline=list(pipeline),
+            pipeline=list(
+                normalized_pipeline
+            ),
+            repair_round=repair_round,
         )
 
-        for role in pipeline:
+        # ----------------------------------------------------
+        # EXECUTE
+        # ----------------------------------------------------
+
+        for role in normalized_pipeline:
 
             result = self.execute_role(
                 state,
@@ -555,6 +1039,7 @@ class ExecutionEngineV2:
             )
 
             if result.status != STATUS_SUCCESS:
+
                 state.status = STATUS_FAILED
 
                 state.add_history(
@@ -565,7 +1050,15 @@ class ExecutionEngineV2:
 
                 return state
 
+        # ----------------------------------------------------
+        # COMPLETE
+        # ----------------------------------------------------
+
         state.status = STATUS_SUCCESS
+
+        state.current_role = (
+            normalized_pipeline[-1]
+        )
 
         state.add_history(
             "execution_completed",
@@ -574,9 +1067,9 @@ class ExecutionEngineV2:
 
         return state
 
-    # --------------------------------------------------------
+    # ========================================================
     # REPAIR
-    # --------------------------------------------------------
+    # ========================================================
 
     def execute_repair(
         self,
@@ -597,14 +1090,25 @@ class ExecutionEngineV2:
             reviewer
                 ↓
             tester
-
-        Repair dibatasi max_repair_rounds.
         """
+
+        if not isinstance(
+            state,
+            ExecutionState,
+        ):
+            raise TypeError(
+                "state harus ExecutionState."
+            )
+
+        # ----------------------------------------------------
+        # LIMIT
+        # ----------------------------------------------------
 
         if (
             state.repair_round
             >= self.max_repair_rounds
         ):
+
             state.status = STATUS_ABORTED
 
             state.add_history(
@@ -615,28 +1119,59 @@ class ExecutionEngineV2:
 
             return state
 
-        state.repair_round += 1
+        # ----------------------------------------------------
+        # VALIDATE ROLES
+        # ----------------------------------------------------
 
-        state.add_history(
-            "repair_started",
-            repair_round=state.repair_round,
-        )
-
-        roles = [
+        repair_roles = [
             debugger_role,
             coder_role,
             reviewer_role,
             tester_role,
         ]
 
-        for role in roles:
+        for role in repair_roles:
+
+            if not isinstance(
+                role,
+                str,
+            ) or not role.strip():
+
+                state.status = STATUS_FAILED
+
+                state.add_history(
+                    "repair_failed",
+                    reason="invalid_repair_role",
+                )
+
+                return state
+
+        # ----------------------------------------------------
+        # INCREMENT ROUND
+        # ----------------------------------------------------
+
+        state.repair_round += 1
+
+        state.status = STATUS_RUNNING
+
+        state.add_history(
+            "repair_started",
+            repair_round=state.repair_round,
+        )
+
+        # ----------------------------------------------------
+        # EXECUTE
+        # ----------------------------------------------------
+
+        for role in repair_roles:
 
             result = self.execute_role(
                 state,
-                role,
+                role.strip(),
             )
 
             if result.status != STATUS_SUCCESS:
+
                 state.status = STATUS_FAILED
 
                 state.add_history(
@@ -647,6 +1182,10 @@ class ExecutionEngineV2:
 
                 return state
 
+        # ----------------------------------------------------
+        # COMPLETE
+        # ----------------------------------------------------
+
         state.status = STATUS_SUCCESS
 
         state.add_history(
@@ -656,16 +1195,16 @@ class ExecutionEngineV2:
 
         return state
 
-    # --------------------------------------------------------
+    # ========================================================
     # SERIALIZATION
-    # --------------------------------------------------------
+    # ========================================================
 
     @staticmethod
     def serialize(
         state: ExecutionState,
     ) -> dict[str, Any]:
         """
-        Serialize state menjadi dictionary.
+        Serialize ExecutionState.
         """
 
         if not isinstance(
@@ -678,16 +1217,16 @@ class ExecutionEngineV2:
 
         return state.to_dict()
 
-    # --------------------------------------------------------
+    # ========================================================
     # SAFE STATUS
-    # --------------------------------------------------------
+    # ========================================================
 
     def status(self) -> dict[str, Any]:
         """
-        Status engine yang aman.
+        Status aman engine.
 
-        Tidak mengembalikan handler internal,
-        API key, atau credential.
+        Tidak mengembalikan handler object,
+        credential, atau API key.
         """
 
         return {
@@ -695,14 +1234,13 @@ class ExecutionEngineV2:
             "registered_roles": sorted(
                 self.handlers.keys()
             ),
-            "max_repair_rounds": (
-                self.max_repair_rounds
-            ),
+            "max_repair_rounds":
+                self.max_repair_rounds,
         }
 
 
 # ============================================================
-# DEFAULT ENGINE
+# FACTORY
 # ============================================================
 
 def create_execution_engine(
@@ -710,13 +1248,17 @@ def create_execution_engine(
     max_repair_rounds: int = MAX_REPAIR_ROUNDS,
 ) -> ExecutionEngineV2:
     """
-    Factory untuk Execution Engine V2.
+    Factory ExecutionEngineV2.
     """
 
     return ExecutionEngineV2(
         max_repair_rounds=max_repair_rounds,
     )
 
+
+# ============================================================
+# EXPORTS
+# ============================================================
 
 __all__ = [
     "STATUS_PENDING",
@@ -729,6 +1271,7 @@ __all__ = [
     "AgentExecutionResult",
     "ExecutionState",
     "AgentExecutionContext",
+    "AgentHandler",
     "ExecutionEngineV2",
     "create_execution_engine",
 ]

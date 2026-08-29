@@ -1,21 +1,26 @@
 """
-Synora Gemini Provider Adapter V1.
+Synora Gemini Provider Adapter V2.1.
 
-Tujuan:
-- menyediakan satu interface Gemini untuk semua agent role
-- menggunakan GeminiKeyPool
-- mendukung 1 API key sekarang
-- siap untuk multi-key di masa depan
-- automatic failover jika pool memiliki beberapa key
-- tidak membocorkan API key
+Fungsi:
+- satu interface Gemini untuk seluruh role;
+- menggunakan GeminiKeyPool;
+- mendukung multi-key;
+- automatic failover;
+- normalisasi response;
+- timeout yang dapat dikonfigurasi;
+- konfigurasi aman melalui environment;
+- API key tidak pernah masuk status/log;
+- backward compatible dengan generate_text().
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from google import genai
+from google.genai import types
 
 from .providers import GeminiKeyPool, ProviderKey
 
@@ -25,6 +30,26 @@ from .providers import GeminiKeyPool, ProviderKey
 # ============================================================
 
 DEFAULT_MODEL = "gemini-3.6-flash"
+DEFAULT_TIMEOUT_MS = 120_000
+
+
+def _env_int(
+    name: str,
+    default: int,
+) -> int:
+    """Membaca integer dari environment secara aman."""
+
+    value = os.getenv(name, "").strip()
+
+    if not value:
+        return default
+
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+
+    return parsed if parsed > 0 else default
 
 
 # ============================================================
@@ -50,18 +75,22 @@ class GeminiAdapter:
     """
     Adapter tunggal untuk komunikasi dengan Gemini.
 
-    Jangan gunakan genai.Client secara langsung dari role.
+    Role tidak boleh membuat genai.Client secara langsung.
 
     Gunakan:
 
         adapter.generate(...)
 
+    atau:
+
+        adapter.generate_text(...)
     """
 
     def __init__(
         self,
         key_pool: Optional[GeminiKeyPool] = None,
         model: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
     ) -> None:
 
         self.key_pool = (
@@ -72,40 +101,106 @@ class GeminiAdapter:
 
         self.model = (
             model
-            or __import__(
-                "os"
-            ).getenv(
+            or os.getenv(
                 "GEMINI_MODEL",
                 DEFAULT_MODEL,
+            ).strip()
+            or DEFAULT_MODEL
+        )
+
+        self.timeout_ms = (
+            timeout_ms
+            if timeout_ms is not None
+            else _env_int(
+                "GEMINI_TIMEOUT_MS",
+                DEFAULT_TIMEOUT_MS,
             )
         )
+
+        if self.timeout_ms <= 0:
+            raise ValueError(
+                "timeout_ms harus lebih besar dari 0."
+            )
 
         if not self.model:
             raise RuntimeError(
                 "Gemini model tidak tersedia."
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CLIENT
-    # --------------------------------------------------------
+    # ========================================================
 
-    @staticmethod
     def _create_client(
+        self,
         provider: ProviderKey,
     ) -> genai.Client:
         """
-        Membuat Gemini client untuk provider tertentu.
+        Membuat client Gemini untuk provider tertentu.
 
-        API key tidak pernah dicetak.
+        Credential hanya digunakan di dalam client.
+        Tidak pernah dikembalikan melalui status().
         """
+
+        http_options = types.HttpOptions(
+            timeout=self.timeout_ms,
+        )
 
         return genai.Client(
             api_key=provider.key,
+            http_options=http_options,
         )
 
-    # --------------------------------------------------------
+    # ========================================================
+    # RESPONSE TEXT
+    # ========================================================
+
+    @staticmethod
+    def _extract_text(
+        response: Any,
+    ) -> str:
+        """
+        Mengambil text dari berbagai bentuk response Gemini.
+        """
+
+        if response is None:
+            return ""
+
+        text = getattr(
+            response,
+            "text",
+            None,
+        )
+
+        if text is not None:
+            if isinstance(text, str):
+                return text.strip()
+
+            return str(text).strip()
+
+        if isinstance(response, dict):
+
+            for key in (
+                "text",
+                "output",
+                "content",
+                "response",
+            ):
+                value = response.get(key)
+
+                if value is None:
+                    continue
+
+                if isinstance(value, str):
+                    return value.strip()
+
+                return str(value).strip()
+
+        return str(response).strip()
+
+    # ========================================================
     # GENERATE
-    # --------------------------------------------------------
+    # ========================================================
 
     def generate(
         self,
@@ -116,7 +211,11 @@ class GeminiAdapter:
         """
         Mengirim prompt ke Gemini.
 
-        Key pool menentukan provider/key yang digunakan.
+        GeminiKeyPool menangani:
+        - pemilihan key;
+        - round-robin;
+        - cooldown;
+        - failover.
         """
 
         if not isinstance(prompt, str):
@@ -130,8 +229,10 @@ class GeminiAdapter:
             )
 
         selected_model = (
-            model
-            or self.model
+            model.strip()
+            if isinstance(model, str)
+            and model.strip()
+            else self.model
         )
 
         if not selected_model:
@@ -147,25 +248,16 @@ class GeminiAdapter:
                 provider
             )
 
-            response = client.models.generate_content(
-                model=selected_model,
-                contents=prompt,
+            response = (
+                client.models.generate_content(
+                    model=selected_model,
+                    contents=prompt,
+                )
             )
 
-            text = getattr(
-                response,
-                "text",
-                None,
+            text = self._extract_text(
+                response
             )
-
-            if text is None:
-                text = ""
-
-            if not isinstance(
-                text,
-                str,
-            ):
-                text = str(text)
 
             return GeminiResponse(
                 text=text,
@@ -177,9 +269,9 @@ class GeminiAdapter:
             operation
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # TEXT HELPER
-    # --------------------------------------------------------
+    # ========================================================
 
     def generate_text(
         self,
@@ -198,20 +290,24 @@ class GeminiAdapter:
 
         return response.text
 
-    # --------------------------------------------------------
+    # ========================================================
     # STATUS
-    # --------------------------------------------------------
+    # ========================================================
 
     def status(self) -> dict[str, Any]:
         """
         Status aman adapter.
 
-        Tidak mengembalikan API key.
+        Tidak mengembalikan:
+        - API key;
+        - secret;
+        - credential value.
         """
 
         return {
             "provider": "gemini",
             "model": self.model,
+            "timeout_ms": self.timeout_ms,
             "key_pool": self.key_pool.status(),
         }
 
@@ -223,6 +319,7 @@ class GeminiAdapter:
 def create_gemini_adapter(
     *,
     model: Optional[str] = None,
+    timeout_ms: Optional[int] = None,
 ) -> GeminiAdapter:
     """
     Factory sederhana untuk membuat adapter.
@@ -230,10 +327,17 @@ def create_gemini_adapter(
 
     return GeminiAdapter(
         model=model,
+        timeout_ms=timeout_ms,
     )
 
 
+# ============================================================
+# PUBLIC API
+# ============================================================
+
 __all__ = [
+    "DEFAULT_MODEL",
+    "DEFAULT_TIMEOUT_MS",
     "GeminiResponse",
     "GeminiAdapter",
     "create_gemini_adapter",

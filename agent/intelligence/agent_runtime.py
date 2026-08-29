@@ -1,5 +1,5 @@
 """
-Synora Agent Runtime V1.
+Synora Agent Runtime V1.1.
 
 High-level runtime yang menghubungkan:
 
@@ -19,15 +19,21 @@ High-level runtime yang menghubungkan:
       ↓
     Gemini Adapter
 
-Runtime dirancang untuk:
-- satu Gemini API key dari .env;
+Runtime bertanggung jawab terhadap orchestration level tinggi.
+
+Design goals:
+- compatibility dengan runtime API sebelumnya;
 - dependency injection untuk testing;
-- context project otomatis;
+- project context otomatis;
 - persistent memory lokal;
 - decision-driven execution;
-- state-aware multi-agent execution;
+- state-aware execution;
 - safe status tanpa secret;
-- compatibility dengan API runtime sebelumnya.
+- pipeline planner -> coder -> reviewer -> tester;
+- repair/debug flow ditangani oleh ExecutionEngineV2;
+- tidak menyimpan API key di result;
+- tidak menganggap output LLM sebagai verification;
+- tidak mengarang execution result.
 """
 
 from __future__ import annotations
@@ -50,7 +56,6 @@ from .decision_engine import (
     DecisionEngine,
 )
 from .execution_engine_v2 import (
-    AgentExecutionResult,
     ExecutionEngineV2,
 )
 from .gemini_adapter import (
@@ -69,12 +74,14 @@ from .router import (
 # CONSTANTS
 # ============================================================
 
-DEFAULT_PIPELINE = [
+DEFAULT_PIPELINE: tuple[str, ...] = (
     "planner",
     "coder",
     "reviewer",
     "tester",
-]
+)
+
+RUNTIME_NAME = "synora-agent-runtime-v1.1"
 
 
 # ============================================================
@@ -84,9 +91,16 @@ DEFAULT_PIPELINE = [
 @dataclass
 class AgentRuntimeResult:
     """
-    Hasil runtime yang aman untuk caller.
+    Hasil high-level execution.
 
-    Tidak menyimpan API key.
+    Object ini merupakan public result untuk caller.
+
+    Tidak boleh menyimpan:
+    - API key
+    - Authorization header
+    - password
+    - credential
+    - secret provider
     """
 
     task: str
@@ -105,6 +119,13 @@ class AgentRuntimeResult:
     )
 
     def to_dict(self) -> dict[str, Any]:
+        """
+        Mengubah result menjadi dictionary.
+
+        Metadata disalin agar caller tidak mendapatkan
+        reference mutable internal.
+        """
+
         return {
             "task": self.task,
             "action": self.action,
@@ -126,9 +147,7 @@ class AgentRuntime:
     """
     Synora Agent Runtime.
 
-    Runtime menghubungkan seluruh intelligence subsystem.
-
-    Default dependency:
+    Runtime menghubungkan seluruh intelligence subsystem:
 
         GeminiAdapter
         IntelligenceRouter
@@ -185,13 +204,13 @@ class AgentRuntime:
         # CONTEXT
         # ----------------------------------------------------
 
-        self.context = (
-            context
-            if context is not None
-            else ContextEngine(
+        if context is not None:
+            self.context = context
+
+        else:
+            self.context = ContextEngine(
                 self.root
             )
-        )
 
         # ----------------------------------------------------
         # MEMORY
@@ -201,17 +220,19 @@ class AgentRuntime:
             self.memory = memory
 
         else:
-            resolved_memory_file = (
-                Path(memory_file)
-                .expanduser()
-                .resolve()
-                if memory_file is not None
-                else (
+            if memory_file is not None:
+                resolved_memory_file = (
+                    Path(memory_file)
+                    .expanduser()
+                    .resolve()
+                )
+
+            else:
+                resolved_memory_file = (
                     self.root
                     / ".synora-agent"
                     / "memory.json"
                 )
-            )
 
             resolved_memory_file.parent.mkdir(
                 parents=True,
@@ -226,37 +247,37 @@ class AgentRuntime:
         # DECISION
         # ----------------------------------------------------
 
-        self.decision = (
-            decision
-            if decision is not None
-            else DecisionEngine(
+        if decision is not None:
+            self.decision = decision
+
+        else:
+            self.decision = DecisionEngine(
                 max_repair_rounds=max_repair_rounds
             )
-        )
 
         # ----------------------------------------------------
         # EXECUTION
         # ----------------------------------------------------
 
-        self.execution = (
-            execution
-            if execution is not None
-            else ExecutionEngineV2(
+        if execution is not None:
+            self.execution = execution
+
+        else:
+            self.execution = ExecutionEngineV2(
                 max_repair_rounds=max_repair_rounds
             )
-        )
 
         # ----------------------------------------------------
         # ROLE ENGINE
         # ----------------------------------------------------
 
-        self.role_engine = (
-            role_engine
-            if role_engine is not None
-            else RoleEngine(
+        if role_engine is not None:
+            self.role_engine = role_engine
+
+        else:
+            self.role_engine = RoleEngine(
                 self.adapter
             )
-        )
 
     # ========================================================
     # ROOT
@@ -273,10 +294,11 @@ class AgentRuntime:
 
         1. explicit root
         2. SYNORA_PROJECT_ROOT
-        3. lokasi package Synora
+        3. package location
         """
 
         if root is not None:
+
             resolved = (
                 Path(root)
                 .expanduser()
@@ -302,6 +324,7 @@ class AgentRuntime:
         )
 
         if env_root:
+
             resolved = (
                 Path(env_root)
                 .expanduser()
@@ -339,8 +362,15 @@ class AgentRuntime:
                 "task harus string."
             )
 
+        normalized_task = task.strip()
+
+        if not normalized_task:
+            raise ValueError(
+                "task tidak boleh kosong."
+            )
+
         return self.router.route(
-            task
+            normalized_task
         )
 
     # ========================================================
@@ -362,13 +392,18 @@ class AgentRuntime:
         agar runtime tetap kompatibel.
         """
 
+        if not isinstance(task, str):
+            raise TypeError(
+                "task harus string."
+            )
+
         method = getattr(
             self.context,
             "build_context",
             None,
         )
 
-        if method is None:
+        if not callable(method):
             return ""
 
         attempts = (
@@ -388,8 +423,12 @@ class AgentRuntime:
         )
 
         for kwargs in attempts:
+
             try:
-                return method(**kwargs)
+                return method(
+                    **kwargs
+                )
+
             except TypeError:
                 continue
 
@@ -409,13 +448,18 @@ class AgentRuntime:
         Build memory context dari persistent memory.
         """
 
+        if not isinstance(task, str):
+            raise TypeError(
+                "task harus string."
+            )
+
         method = getattr(
             self.memory,
             "build_context",
             None,
         )
 
-        if method is None:
+        if not callable(method):
             return ""
 
         attempts = (
@@ -440,35 +484,28 @@ class AgentRuntime:
         )
 
         for kwargs in attempts:
+
             try:
+
                 result = method(
                     **kwargs
                 )
 
-                if result is None:
-                    return ""
-
-                if isinstance(
-                    result,
-                    str,
-                ):
-                    return result
-
-                return str(result)
+                return self._to_text(
+                    result
+                )
 
             except TypeError:
                 continue
 
         try:
-            result = method(task)
 
-            if result is None:
-                return ""
+            result = method(
+                task
+            )
 
-            return (
+            return self._to_text(
                 result
-                if isinstance(result, str)
-                else str(result)
             )
 
         except TypeError:
@@ -498,10 +535,6 @@ class AgentRuntime:
                 "task harus string."
             )
 
-        # ----------------------------------------------------
-        # EMPTY
-        # ----------------------------------------------------
-
         if not task.strip():
             return AgentDecision(
                 action=ACTION_ABORT,
@@ -511,14 +544,42 @@ class AgentRuntime:
                 reason="Task kosong.",
             )
 
+        try:
+            normalized_repair_round = int(
+                repair_round
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            normalized_repair_round = 0
+
+        if normalized_repair_round < 0:
+            normalized_repair_round = 0
+
         # ----------------------------------------------------
         # REPAIR LIMIT
         # ----------------------------------------------------
 
-        if (
-            repair_round
-            > self.decision.max_repair_rounds
+        max_repair_rounds = getattr(
+            self.decision,
+            "max_repair_rounds",
+            2,
+        )
+
+        try:
+            max_repair_rounds = int(
+                max_repair_rounds
+            )
+
+        except (
+            TypeError,
+            ValueError,
         ):
+            max_repair_rounds = 2
+
+        if normalized_repair_round > max_repair_rounds:
             return AgentDecision(
                 action=ACTION_ABORT,
                 next_role=None,
@@ -526,7 +587,10 @@ class AgentRuntime:
                 confidence=1.0,
                 reason="Batas repair tercapai.",
                 metadata={
-                    "repair_round": repair_round,
+                    "repair_round":
+                        normalized_repair_round,
+                    "max_repair_rounds":
+                        max_repair_rounds,
                 },
             )
 
@@ -541,13 +605,14 @@ class AgentRuntime:
         )
 
         for method_name in methods:
+
             method = getattr(
                 self.decision,
                 method_name,
                 None,
             )
 
-            if method is None:
+            if not callable(method):
                 continue
 
             attempts = (
@@ -561,7 +626,7 @@ class AgentRuntime:
                     "tester_passed":
                         tester_passed,
                     "repair_round":
-                        repair_round,
+                        normalized_repair_round,
                     "pipeline_complete":
                         pipeline_complete,
                 },
@@ -575,7 +640,7 @@ class AgentRuntime:
                     "tester_passed":
                         tester_passed,
                     "repair_round":
-                        repair_round,
+                        normalized_repair_round,
                     "pipeline_complete":
                         pipeline_complete,
                 },
@@ -589,7 +654,9 @@ class AgentRuntime:
             )
 
             for kwargs in attempts:
+
                 try:
+
                     result = method(
                         **kwargs
                     )
@@ -597,6 +664,17 @@ class AgentRuntime:
                     if isinstance(
                         result,
                         AgentDecision,
+                    ):
+                        return result
+
+                    # Compatibility dengan object
+                    # yang mempunyai action/next_role.
+                    if (
+                        result is not None
+                        and hasattr(
+                            result,
+                            "action",
+                        )
                     ):
                         return result
 
@@ -643,6 +721,10 @@ class AgentRuntime:
                 reason="Tester gagal.",
             )
 
+        # ----------------------------------------------------
+        # ROUTER FALLBACK
+        # ----------------------------------------------------
+
         routing = self.route(
             task
         )
@@ -673,8 +755,8 @@ class AgentRuntime:
         action, next_role = role_map.get(
             routing.role,
             (
-                ACTION_CODE,
-                "coder",
+                ACTION_PLAN,
+                "planner",
             ),
         )
 
@@ -682,8 +764,28 @@ class AgentRuntime:
             action=action,
             next_role=next_role,
             should_continue=True,
-            confidence=routing.confidence,
-            reason=routing.reason,
+            confidence=self._normalize_confidence(
+                getattr(
+                    routing,
+                    "confidence",
+                    0.50,
+                )
+            ),
+            reason=str(
+                getattr(
+                    routing,
+                    "reason",
+                    "Routing selesai.",
+                )
+            ),
+            metadata={
+                "routing_role":
+                    getattr(
+                        routing,
+                        "role",
+                        None,
+                    ),
+            },
         )
 
     # ========================================================
@@ -703,13 +805,23 @@ class AgentRuntime:
         Jalankan role melalui RoleEngine.
         """
 
+        if not isinstance(role, str):
+            raise TypeError(
+                "role harus string."
+            )
+
+        if not isinstance(task, str):
+            raise TypeError(
+                "task harus string."
+            )
+
         method = getattr(
             self.role_engine,
             "run",
             None,
         )
 
-        if method is None:
+        if not callable(method):
             raise RuntimeError(
                 "RoleEngine tidak memiliki method run()."
             )
@@ -745,10 +857,12 @@ class AgentRuntime:
         last_error: Optional[Exception] = None
 
         for kwargs in attempts:
+
             try:
                 return method(
                     **kwargs
                 )
+
             except TypeError as exc:
                 last_error = exc
                 continue
@@ -770,39 +884,84 @@ class AgentRuntime:
         memory_context: str,
     ):
         """
-        Membuat handler adapter untuk ExecutionEngineV2.
+        Membuat bridge:
 
-        ExecutionEngineV2 membutuhkan:
-
-            AgentExecutionContext -> Any
-
-        Sedangkan RoleEngine membutuhkan:
-
-            role
-            task
-            context
-            memory_context
-            previous_result
-
-        Method ini menjadi bridge antara keduanya.
+            ExecutionEngineV2
+                    ↓
+              RoleEngine
+                    ↓
+              GeminiAdapter
         """
 
-        def handler(execution_context: Any) -> dict[str, Any]:
+        def handler(
+            execution_context: Any,
+        ) -> dict[str, Any]:
+
             previous_result = ""
 
-            if execution_context.previous_results:
-                previous = (
-                    execution_context.previous_results[-1]
+            previous_results = getattr(
+                execution_context,
+                "previous_results",
+                None,
+            )
+
+            if previous_results:
+
+                try:
+                    previous = (
+                        previous_results[-1]
+                    )
+
+                    previous_result = (
+                        self._extract_output(
+                            previous
+                        )
+                    )
+
+                except (
+                    IndexError,
+                    TypeError,
+                ):
+                    previous_result = ""
+
+            role = self._to_text(
+                getattr(
+                    execution_context,
+                    "role",
+                    "",
+                )
+            ).strip()
+
+            task = self._to_text(
+                getattr(
+                    execution_context,
+                    "task",
+                    "",
+                )
+            ).strip()
+
+            context = self._to_text(
+                getattr(
+                    execution_context,
+                    "context",
+                    "",
+                )
+            )
+
+            if not role:
+                raise RuntimeError(
+                    "Execution context tidak memiliki role."
                 )
 
-                previous_result = (
-                    self._extract_output(previous)
+            if not task:
+                raise RuntimeError(
+                    "Execution context tidak memiliki task."
                 )
 
             role_result = self.run_role(
-                role=execution_context.role,
-                task=execution_context.task,
-                context=execution_context.context,
+                role=role,
+                task=task,
+                context=context,
                 memory_context=memory_context,
                 previous_result=previous_result,
             )
@@ -819,15 +978,31 @@ class AgentRuntime:
                 role_result
             )
 
+            normalized_status = (
+                status.strip().lower()
+                if isinstance(
+                    status,
+                    str,
+                )
+                else str(status).strip().lower()
+            )
+
+            failure_statuses = {
+                "failed",
+                "failure",
+                "error",
+                "errored",
+                "cancelled",
+                "canceled",
+                "aborted",
+            }
+
             if (
-                status not in {
-                    "",
-                    "success",
-                    "completed",
-                    "ok",
-                }
+                normalized_status
+                in failure_statuses
                 or success is False
             ):
+
                 error = self._extract_error(
                     role_result
                 )
@@ -835,7 +1010,7 @@ class AgentRuntime:
                 raise RuntimeError(
                     error
                     or (
-                        f"Role '{execution_context.role}' "
+                        f"Role '{role}' "
                         "gagal dieksekusi."
                     )
                 )
@@ -843,10 +1018,11 @@ class AgentRuntime:
             return {
                 "output": output,
                 "metadata": {
-                    "role": execution_context.role,
-                    "runtime": (
-                        "synora-agent-runtime-v1"
-                    ),
+                    "role": role,
+                    "runtime": RUNTIME_NAME,
+                    "status":
+                        normalized_status
+                        or "success",
                 },
             }
 
@@ -867,27 +1043,115 @@ class AgentRuntime:
         """
         Jalankan pipeline melalui ExecutionEngineV2.
 
-        Handler didaftarkan ulang setiap execution agar
-        dependency injection tetap aman untuk testing.
+        Pipeline default:
+
+            planner
+              ↓
+            coder
+              ↓
+            reviewer
+              ↓
+            tester
+
+        Jika ExecutionEngineV2 memiliki repair/debug flow,
+        engine tersebut menjadi source of truth untuk siklus
+        repair.
         """
+
+        if not pipeline:
+            raise ValueError(
+                "Pipeline tidak boleh kosong."
+            )
 
         handler = self._create_execution_handler(
             memory_context=memory_context,
         )
 
+        register = getattr(
+            self.execution,
+            "register",
+            None,
+        )
+
+        if not callable(register):
+            raise RuntimeError(
+                "ExecutionEngineV2 tidak memiliki "
+                "method register()."
+            )
+
+        # ----------------------------------------------------
+        # REGISTER ROLE HANDLERS
+        # ----------------------------------------------------
+
         for role in pipeline:
-            self.execution.register(
+
+            if not isinstance(
                 role,
+                str,
+            ):
+                raise TypeError(
+                    "Semua pipeline role harus string."
+                )
+
+            normalized_role = role.strip().lower()
+
+            if not normalized_role:
+                raise ValueError(
+                    "Pipeline mengandung role kosong."
+                )
+
+            register(
+                normalized_role,
                 handler,
             )
 
-        state = self.execution.execute(
-            task,
-            list(pipeline),
-            context=context,
+        # ----------------------------------------------------
+        # EXECUTE
+        # ----------------------------------------------------
+
+        execute = getattr(
+            self.execution,
+            "execute",
+            None,
         )
 
-        return state
+        if not callable(execute):
+            raise RuntimeError(
+                "ExecutionEngineV2 tidak memiliki "
+                "method execute()."
+            )
+
+        attempts = (
+            {
+                "task": task,
+                "pipeline": list(pipeline),
+                "context": context,
+            },
+            {
+                "task": task,
+                "pipeline": list(pipeline),
+            },
+        )
+
+        last_error: Optional[Exception] = None
+
+        for kwargs in attempts:
+
+            try:
+                return execute(
+                    **kwargs
+                )
+
+            except TypeError as exc:
+                last_error = exc
+                continue
+
+        if last_error is not None:
+            raise last_error
+
+        raise RuntimeError(
+            "ExecutionEngineV2 gagal menjalankan pipeline."
+        )
 
     # ========================================================
     # EXECUTE
@@ -907,7 +1171,9 @@ class AgentRuntime:
 
         Flow:
 
-            route
+            task
+              ↓
+            router
               ↓
             context
               ↓
@@ -915,13 +1181,13 @@ class AgentRuntime:
               ↓
             decision
               ↓
-            execution pipeline
+            execution engine
               ↓
             role engine
               ↓
             Gemini
 
-        Pipeline default:
+        Pipeline:
 
             planner
               ↓
@@ -942,6 +1208,7 @@ class AgentRuntime:
         # ----------------------------------------------------
 
         if not task.strip():
+
             decision = self.decide(
                 task=""
             )
@@ -954,10 +1221,12 @@ class AgentRuntime:
                 confidence=decision.confidence,
                 reason=decision.reason,
                 metadata={
-                    "root": str(self.root),
-                    "pipeline": list(
-                        DEFAULT_PIPELINE
-                    ),
+                    "runtime":
+                        RUNTIME_NAME,
+                    "root":
+                        str(self.root),
+                    "pipeline":
+                        list(DEFAULT_PIPELINE),
                 },
             )
 
@@ -971,14 +1240,41 @@ class AgentRuntime:
             normalized_task
         )
 
+        routing_role = self._normalize_role(
+            getattr(
+                routing,
+                "role",
+                None,
+            )
+        )
+
+        routing_confidence = (
+            self._normalize_confidence(
+                getattr(
+                    routing,
+                    "confidence",
+                    0.50,
+                )
+            )
+        )
+
+        routing_reason = str(
+            getattr(
+                routing,
+                "reason",
+                "Routing selesai.",
+            )
+        )
+
         # ----------------------------------------------------
         # CONTEXT
         # ----------------------------------------------------
 
         if context is None:
+
             context_result = self.build_context(
                 normalized_task,
-                role=routing.role,
+                role=routing_role,
                 max_files=max_files,
                 max_chars=max_chars,
             )
@@ -988,13 +1284,24 @@ class AgentRuntime:
             )
 
         else:
-            context_text = context
+
+            context_text = (
+                context
+                if isinstance(
+                    context,
+                    str,
+                )
+                else str(context)
+            )
+
+        context_text = context_text.strip()
 
         # ----------------------------------------------------
         # MEMORY
         # ----------------------------------------------------
 
         if memory_context is None:
+
             memory_text = (
                 self.build_memory_context(
                     normalized_task
@@ -1002,7 +1309,17 @@ class AgentRuntime:
             )
 
         else:
-            memory_text = memory_context
+
+            memory_text = (
+                memory_context
+                if isinstance(
+                    memory_context,
+                    str,
+                )
+                else str(memory_context)
+            )
+
+        memory_text = memory_text.strip()
 
         # ----------------------------------------------------
         # DECISION
@@ -1010,7 +1327,7 @@ class AgentRuntime:
 
         decision = self.decide(
             task=normalized_task,
-            role=routing.role,
+            role=routing_role,
         )
 
         # ----------------------------------------------------
@@ -1021,6 +1338,7 @@ class AgentRuntime:
             ACTION_ABORT,
             ACTION_FINISH,
         }:
+
             return AgentRuntimeResult(
                 task=normalized_task,
                 action=decision.action,
@@ -1031,159 +1349,278 @@ class AgentRuntime:
                     else "success"
                 ),
                 role=decision.next_role,
-                confidence=decision.confidence,
+                confidence=(
+                    self._normalize_confidence(
+                        decision.confidence
+                    )
+                ),
                 reason=decision.reason,
                 metadata={
-                    "root": str(self.root),
+                    "runtime":
+                        RUNTIME_NAME,
+                    "root":
+                        str(self.root),
                     "routing_role":
-                        routing.role,
+                        routing_role,
                     "routing_confidence":
-                        routing.confidence,
-                    "pipeline": list(
-                        DEFAULT_PIPELINE
-                    ),
+                        routing_confidence,
+                    "routing_reason":
+                        routing_reason,
+                    "pipeline":
+                        list(DEFAULT_PIPELINE),
                 },
             )
 
         # ----------------------------------------------------
-        # INITIAL ROLE
+        # PUBLIC ROLE
         # ----------------------------------------------------
         #
-        # Routing tetap menjadi sumber role utama untuk
-        # high-level execution.
+        # Router menentukan role domain utama.
         #
-        # Contoh:
+        # Namun execution pipeline tetap menggunakan:
         #
-        #     task -> "buat endpoint RPC baru"
+        # planner -> coder -> reviewer -> tester
         #
-        # Router -> coder
+        # Hal ini penting supaya task coding tidak langsung
+        # melewati planning/review/testing.
         #
-        # Walaupun DecisionEngine dapat mengatakan:
-        #
-        #     action = plan
-        #     next_role = planner
-        #
-        # role public runtime tetap coder karena task
-        # dirouting sebagai coding task.
-        #
-        role = routing.role
+
+        role = routing_role
 
         if not role and decision.next_role:
-            role = decision.next_role
+            role = self._normalize_role(
+                decision.next_role
+            )
+
+        if not role:
+            role = "planner"
 
         # ----------------------------------------------------
         # PIPELINE
         # ----------------------------------------------------
-        #
-        # ExecutionEngineV2 sekarang benar-benar digunakan.
-        #
-        # Ini menghasilkan:
-        #
-        #     state.results
-        #     state.history
-        #     state.plan
-        #     state.changes
-        #     state.verification
-        #
+
         pipeline = list(
             DEFAULT_PIPELINE
         )
 
-        execution_state = self._execute_pipeline(
-            task=normalized_task,
-            pipeline=pipeline,
-            context=context_text,
-            memory_context=memory_text,
-        )
+        # ----------------------------------------------------
+        # EXECUTION
+        # ----------------------------------------------------
+
+        try:
+
+            execution_state = (
+                self._execute_pipeline(
+                    task=normalized_task,
+                    pipeline=pipeline,
+                    context=context_text,
+                    memory_context=memory_text,
+                )
+            )
+
+        except Exception as error:
+
+            error_text = self._sanitize_error(
+                str(error)
+            )
+
+            return AgentRuntimeResult(
+                task=normalized_task,
+                action=ACTION_DEBUG,
+                status="failed",
+                role=role,
+                confidence=(
+                    min(
+                        routing_confidence,
+                        0.50,
+                    )
+                ),
+                output="",
+                reason=(
+                    "Execution pipeline gagal: "
+                    + error_text
+                ),
+                repair_rounds=0,
+                metadata={
+                    "runtime":
+                        RUNTIME_NAME,
+                    "root":
+                        str(self.root),
+                    "routing_role":
+                        routing_role,
+                    "routing_confidence":
+                        routing_confidence,
+                    "pipeline":
+                        list(pipeline),
+                    "decision_action":
+                        decision.action,
+                    "decision_next_role":
+                        decision.next_role,
+                    "execution_error":
+                        error_text,
+                },
+            )
 
         # ----------------------------------------------------
         # PUBLIC OUTPUT
         # ----------------------------------------------------
 
-        execution_results = list(
-            execution_state.results
+        execution_results = (
+            self._extract_execution_results(
+                execution_state
+            )
         )
 
-        # Cari output dari role yang dirouting.
-        #
-        # Ini membuat:
-        #
-        #     result.role == "coder"
-        #
-        # tetap konsisten dengan router meskipun pipeline
-        # berjalan planner -> coder -> reviewer -> tester.
         output = ""
 
+        # Cari output dari role yang dirouting.
         for execution_result in execution_results:
+
+            result_role = self._normalize_role(
+                getattr(
+                    execution_result,
+                    "role",
+                    None,
+                )
+            )
+
             if (
-                execution_result.role
+                result_role
                 == role
             ):
-                output = execution_result.output
-                break
+
+                output = self._extract_output(
+                    execution_result
+                )
+
+                if output:
+                    break
 
         # Fallback ke hasil terakhir.
-        if not output and execution_results:
-            output = execution_results[-1].output
+        if (
+            not output
+            and execution_results
+        ):
+
+            output = self._extract_output(
+                execution_results[-1]
+            )
 
         # ----------------------------------------------------
         # STATUS
         # ----------------------------------------------------
 
-        status = (
-            "success"
-            if execution_state.status
-            == "success"
-            else execution_state.status
+        execution_status = (
+            self._extract_execution_status(
+                execution_state
+            )
         )
+
+        if not execution_status:
+            execution_status = (
+                "success"
+                if execution_results
+                else "failed"
+            )
+
+        normalized_execution_status = (
+            execution_status.strip().lower()
+        )
+
+        if normalized_execution_status in {
+            "success",
+            "completed",
+            "complete",
+            "ok",
+            "passed",
+            "pass",
+        }:
+
+            status = "success"
+
+        elif normalized_execution_status in {
+            "failed",
+            "failure",
+            "error",
+            "errored",
+            "cancelled",
+            "canceled",
+            "aborted",
+        }:
+
+            status = "failed"
+
+        else:
+            status = normalized_execution_status
 
         # ----------------------------------------------------
         # EXECUTION METADATA
         # ----------------------------------------------------
-        #
-        # Penting:
-        #
-        # execution["results"]
-        # harus LIST.
-        #
-        # Bukan RoleExecutionResult tunggal.
-        #
+
         execution_metadata = (
-            execution_state.to_dict()
+            self._safe_to_dict(
+                execution_state
+            )
         )
+
+        repair_round = (
+            self._extract_repair_round(
+                execution_state
+            )
+        )
+
+        # ----------------------------------------------------
+        # FINAL RESULT
+        # ----------------------------------------------------
 
         return AgentRuntimeResult(
             task=normalized_task,
-            action=decision.action,
+            action=(
+                ACTION_FINISH
+                if status == "success"
+                else decision.action
+            ),
             status=status,
             role=role,
-            confidence=decision.confidence,
+            confidence=(
+                self._normalize_confidence(
+                    decision.confidence
+                )
+            ),
             output=output,
             reason=decision.reason,
-            repair_rounds=(
-                execution_state.repair_round
-            ),
+            repair_rounds=repair_round,
             metadata={
-                "root": str(self.root),
+                "runtime":
+                    RUNTIME_NAME,
+
+                "root":
+                    str(self.root),
 
                 "routing_role":
-                    routing.role,
+                    routing_role,
 
                 "routing_confidence":
-                    routing.confidence,
+                    routing_confidence,
 
-                "pipeline": list(
-                    pipeline
-                ),
+                "routing_reason":
+                    routing_reason,
+
+                "pipeline":
+                    list(pipeline),
 
                 "execution_role":
                     role,
 
-                # Full state dari ExecutionEngineV2.
+                "execution_status":
+                    execution_status,
+
+                "execution_results_count":
+                    len(execution_results),
+
                 "execution":
                     execution_metadata,
 
-                # Observability DecisionEngine.
                 "decision_action":
                     decision.action,
 
@@ -1219,6 +1656,7 @@ class AgentRuntime:
             "content",
             "context",
         ):
+
             value_attribute = getattr(
                 value,
                 attribute,
@@ -1228,7 +1666,9 @@ class AgentRuntime:
             if callable(
                 value_attribute
             ):
+
                 try:
+
                     result = (
                         value_attribute()
                     )
@@ -1246,6 +1686,7 @@ class AgentRuntime:
                 value_attribute,
                 str,
             ):
+
                 return value_attribute
 
         return str(value)
@@ -1264,13 +1705,13 @@ class AgentRuntime:
         Mendukung:
 
         - str
+        - dict
         - AgentExecutionResult
         - RoleExecutionResult
         - object.text
         - object.output
         - object.content
         - object.result
-        - dict
         """
 
         if result is None:
@@ -1286,15 +1727,20 @@ class AgentRuntime:
             result,
             dict,
         ):
+
             for key in (
                 "output",
                 "text",
                 "content",
                 "result",
             ):
+
                 value = result.get(
                     key
                 )
+
+                if value is None:
+                    continue
 
                 if isinstance(
                     value,
@@ -1302,23 +1748,39 @@ class AgentRuntime:
                 ):
                     return value
 
+                if isinstance(
+                    value,
+                    (dict, list),
+                ):
+                    return str(value)
+
         for attribute in (
             "text",
             "output",
             "content",
             "result",
         ):
+
             value = getattr(
                 result,
                 attribute,
                 None,
             )
 
+            if value is None:
+                continue
+
             if isinstance(
                 value,
                 str,
             ):
                 return value
+
+            if isinstance(
+                value,
+                (dict, list),
+            ):
+                return str(value)
 
         return str(result)
 
@@ -1341,11 +1803,13 @@ class AgentRuntime:
             result,
             dict,
         ):
+
             status = result.get(
                 "status"
             )
 
             if status is None:
+
                 if result.get(
                     "success"
                 ) is False:
@@ -1353,9 +1817,7 @@ class AgentRuntime:
 
                 return "success"
 
-            return str(
-                status
-            )
+            return str(status)
 
         status = getattr(
             result,
@@ -1364,6 +1826,7 @@ class AgentRuntime:
         )
 
         if status is None:
+
             success = getattr(
                 result,
                 "success",
@@ -1374,12 +1837,6 @@ class AgentRuntime:
                 return "failed"
 
             return "success"
-
-        if isinstance(
-            status,
-            str,
-        ):
-            return status
 
         return str(status)
 
@@ -1397,7 +1854,7 @@ class AgentRuntime:
         Return:
             True
             False
-            None jika tidak tersedia.
+            None
         """
 
         if result is None:
@@ -1407,6 +1864,7 @@ class AgentRuntime:
             result,
             dict,
         ):
+
             value = result.get(
                 "success"
             )
@@ -1452,6 +1910,7 @@ class AgentRuntime:
             result,
             dict,
         ):
+
             value = result.get(
                 "error"
             )
@@ -1473,6 +1932,346 @@ class AgentRuntime:
         return str(value)
 
     # ========================================================
+    # EXECUTION RESULT EXTRACTION
+    # ========================================================
+
+    @staticmethod
+    def _extract_execution_results(
+        execution_state: Any,
+    ) -> list[Any]:
+        """
+        Ambil execution results sebagai LIST.
+
+        Ini penting karena ExecutionEngineV2 menyimpan
+        banyak result, bukan satu RoleExecutionResult.
+        """
+
+        if execution_state is None:
+            return []
+
+        if isinstance(
+            execution_state,
+            dict,
+        ):
+
+            results = execution_state.get(
+                "results"
+            )
+
+            if results is None:
+                return []
+
+            if isinstance(
+                results,
+                list,
+            ):
+                return list(results)
+
+            if isinstance(
+                results,
+                tuple,
+            ):
+                return list(results)
+
+            return [results]
+
+        results = getattr(
+            execution_state,
+            "results",
+            None,
+        )
+
+        if results is None:
+            return []
+
+        if isinstance(
+            results,
+            list,
+        ):
+            return list(results)
+
+        if isinstance(
+            results,
+            tuple,
+        ):
+            return list(results)
+
+        try:
+            return list(results)
+
+        except TypeError:
+            return [results]
+
+    # ========================================================
+    # EXECUTION STATUS
+    # ========================================================
+
+    @staticmethod
+    def _extract_execution_status(
+        execution_state: Any,
+    ) -> str:
+        """
+        Ambil status dari ExecutionState.
+        """
+
+        if execution_state is None:
+            return ""
+
+        if isinstance(
+            execution_state,
+            dict,
+        ):
+
+            status = execution_state.get(
+                "status"
+            )
+
+            if status is not None:
+                return str(status)
+
+            if execution_state.get(
+                "success"
+            ) is True:
+                return "success"
+
+            if execution_state.get(
+                "success"
+            ) is False:
+                return "failed"
+
+            return ""
+
+        status = getattr(
+            execution_state,
+            "status",
+            None,
+        )
+
+        if status is not None:
+            return str(status)
+
+        success = getattr(
+            execution_state,
+            "success",
+            None,
+        )
+
+        if success is True:
+            return "success"
+
+        if success is False:
+            return "failed"
+
+        return ""
+
+    # ========================================================
+    # REPAIR ROUND
+    # ========================================================
+
+    @staticmethod
+    def _extract_repair_round(
+        execution_state: Any,
+    ) -> int:
+        """
+        Ambil repair round dari execution state.
+        """
+
+        if execution_state is None:
+            return 0
+
+        if isinstance(
+            execution_state,
+            dict,
+        ):
+
+            value = execution_state.get(
+                "repair_round",
+                0,
+            )
+
+        else:
+
+            value = getattr(
+                execution_state,
+                "repair_round",
+                0,
+            )
+
+        try:
+
+            normalized = int(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return 0
+
+        return max(
+            0,
+            normalized,
+        )
+
+    # ========================================================
+    # SAFE DICT
+    # ========================================================
+
+    @staticmethod
+    def _safe_to_dict(
+        value: Any,
+    ) -> dict[str, Any]:
+        """
+        Convert object menjadi dictionary jika memungkinkan.
+
+        Tidak pernah melempar exception hanya karena
+        observability gagal.
+        """
+
+        if value is None:
+            return {}
+
+        if isinstance(
+            value,
+            dict,
+        ):
+            return dict(value)
+
+        method = getattr(
+            value,
+            "to_dict",
+            None,
+        )
+
+        if callable(method):
+
+            try:
+
+                result = method()
+
+                if isinstance(
+                    result,
+                    dict,
+                ):
+                    return dict(result)
+
+            except Exception:
+                pass
+
+        try:
+
+            return {
+                "value": str(value)
+            }
+
+        except Exception:
+            return {}
+
+    # ========================================================
+    # ROLE NORMALIZATION
+    # ========================================================
+
+    @staticmethod
+    def _normalize_role(
+        role: Any,
+    ) -> str:
+        """
+        Normalisasi role secara aman.
+        """
+
+        if role is None:
+            return ""
+
+        value = getattr(
+            role,
+            "value",
+            role,
+        )
+
+        return str(
+            value
+        ).strip().lower()
+
+    # ========================================================
+    # CONFIDENCE NORMALIZATION
+    # ========================================================
+
+    @staticmethod
+    def _normalize_confidence(
+        value: Any,
+    ) -> float:
+        """
+        Normalisasi confidence ke 0.0 - 1.0.
+        """
+
+        try:
+
+            confidence = float(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return 0.0
+
+        if confidence < 0.0:
+            return 0.0
+
+        if confidence > 1.0:
+            return 1.0
+
+        return confidence
+
+    # ========================================================
+    # ERROR SANITIZATION
+    # ========================================================
+
+    @staticmethod
+    def _sanitize_error(
+        error: Any,
+    ) -> str:
+        """
+        Sanitasi error agar credential tidak bocor ke caller.
+
+        Error provider yang mengandung marker credential
+        diganti dengan pesan generik.
+        """
+
+        if error is None:
+            return ""
+
+        text = str(error)
+
+        lowered = text.lower()
+
+        sensitive_markers = (
+            "api_key",
+            "apikey",
+            "authorization",
+            "bearer",
+            "secret",
+            "password",
+            "credential",
+            "access_token",
+            "refresh_token",
+            "private_key",
+        )
+
+        if any(
+            marker in lowered
+            for marker in sensitive_markers
+        ):
+            return (
+                "Provider mengalami "
+                "authentication/provider error."
+            )
+
+        return text
+
+    # ========================================================
     # STATUS
     # ========================================================
 
@@ -1487,6 +2286,7 @@ class AgentRuntime:
         adapter_status: dict[str, Any] = {}
 
         try:
+
             method = getattr(
                 self.adapter,
                 "status",
@@ -1494,6 +2294,7 @@ class AgentRuntime:
             )
 
             if callable(method):
+
                 result = method()
 
                 if isinstance(
@@ -1510,9 +2311,14 @@ class AgentRuntime:
                 "status": "unavailable",
             }
 
+        # Defensive sanitization terhadap provider status.
+        adapter_status = self._sanitize_status_dict(
+            adapter_status
+        )
+
         return {
             "runtime":
-                "synora-agent-runtime-v1",
+                RUNTIME_NAME,
 
             "root":
                 str(self.root),
@@ -1549,7 +2355,84 @@ class AgentRuntime:
                 type(
                     self.role_engine
                 ).__name__,
+
+            "pipeline":
+                list(DEFAULT_PIPELINE),
         }
+
+    # ========================================================
+    # STATUS SANITIZATION
+    # ========================================================
+
+    @classmethod
+    def _sanitize_status_dict(
+        cls,
+        value: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Sanitasi recursive dictionary sederhana.
+
+        Key credential tidak dikembalikan.
+        """
+
+        blocked_keys = {
+            "api_key",
+            "apikey",
+            "authorization",
+            "password",
+            "secret",
+            "token",
+            "access_token",
+            "refresh_token",
+            "private_key",
+            "credential",
+        }
+
+        sanitized: dict[str, Any] = {}
+
+        for key, item in value.items():
+
+            normalized_key = str(
+                key
+            ).strip().lower()
+
+            if normalized_key in blocked_keys:
+                continue
+
+            if isinstance(
+                item,
+                dict,
+            ):
+
+                sanitized[key] = (
+                    cls._sanitize_status_dict(
+                        item
+                    )
+                )
+
+            elif isinstance(
+                item,
+                list,
+            ):
+
+                sanitized[key] = [
+                    (
+                        cls._sanitize_status_dict(
+                            entry
+                        )
+                        if isinstance(
+                            entry,
+                            dict,
+                        )
+                        else entry
+                    )
+                    for entry in item
+                ]
+
+            else:
+                sanitized[key] = item
+
+        return sanitized
 
 
 # ============================================================
@@ -1586,5 +2469,6 @@ def create_agent_runtime(
 __all__ = [
     "AgentRuntime",
     "AgentRuntimeResult",
+    "DEFAULT_PIPELINE",
     "create_agent_runtime",
 ]

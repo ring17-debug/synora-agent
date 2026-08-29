@@ -1,43 +1,25 @@
 """
-Synora Role Engine V2.
+Synora Role Engine V2.2.
 
-Tugas:
-- menjalankan role agent melalui GeminiAdapter;
-- membuat prompt berdasarkan role;
-- membersihkan output model;
-- melakukan parsing JSON result secara aman;
-- meneruskan context dan hasil role sebelumnya;
-- menjaga compatibility dengan public API Synora.
-
-Credential/API key tidak dikelola di file ini.
-Semua komunikasi provider dilakukan melalui GeminiAdapter.
+Role definition menggunakan roles.py sebagai single source of truth.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-import re
 from typing import Any
 
 from .gemini_adapter import GeminiAdapter
-from .roles import AgentRole
+from .roles import AgentRole, get_role
 
 
 # ============================================================
 # TEXT UTILITIES
 # ============================================================
 
-def clean_role_text(
-    text: Any,
-) -> str:
-    """
-    Membersihkan output Gemini sebelum diteruskan
-    ke pipeline agent.
-
-    Fungsi ini sengaja tidak melakukan perubahan agresif
-    terhadap isi kode.
-    """
+def clean_role_text(text: Any) -> str:
+    """Membersihkan output model tanpa mengubah isi secara agresif."""
 
     if text is None:
         return ""
@@ -47,15 +29,11 @@ def clean_role_text(
 
     text = text.strip()
 
-    # Hapus markdown fence di awal/akhir jika seluruh
-    # response dibungkus code fence.
     if text.startswith("```") and text.endswith("```"):
         lines = text.splitlines()
 
         if len(lines) >= 2:
-            first = lines[0].strip()
-
-            if first.startswith("```"):
+            if lines[0].strip().startswith("```"):
                 lines = lines[1:]
 
             if lines and lines[-1].strip() == "```":
@@ -73,17 +51,7 @@ def clean_role_text(
 def parse_json_result(
     value: Any,
 ) -> dict[str, Any] | list[Any] | None:
-    """
-    Parse JSON dari hasil role.
-
-    Mendukung:
-    - dictionary/list langsung;
-    - JSON string;
-    - JSON yang dibungkus markdown code fence;
-    - JSON yang memiliki sedikit text di sekelilingnya.
-
-    Jika tidak dapat diparse, return None.
-    """
+    """Parse hasil role sebagai JSON jika memungkinkan."""
 
     if isinstance(value, (dict, list)):
         return value
@@ -99,7 +67,6 @@ def parse_json_result(
     if not text:
         return None
 
-    # Percobaan pertama: JSON langsung.
     try:
         parsed = json.loads(text)
 
@@ -109,7 +76,6 @@ def parse_json_result(
     except json.JSONDecodeError:
         pass
 
-    # Bersihkan markdown fence.
     cleaned = clean_role_text(text)
 
     try:
@@ -121,12 +87,10 @@ def parse_json_result(
     except json.JSONDecodeError:
         pass
 
-    # Cari object JSON.
     object_start = cleaned.find("{")
     object_end = cleaned.rfind("}")
 
     if object_start >= 0 and object_end > object_start:
-
         candidate = cleaned[
             object_start : object_end + 1
         ]
@@ -140,12 +104,10 @@ def parse_json_result(
         except json.JSONDecodeError:
             pass
 
-    # Cari array JSON.
     array_start = cleaned.find("[")
     array_end = cleaned.rfind("]")
 
     if array_start >= 0 and array_end > array_start:
-
         candidate = cleaned[
             array_start : array_end + 1
         ]
@@ -168,9 +130,7 @@ def parse_json_result(
 
 @dataclass(frozen=True)
 class RoleExecutionResult:
-    """
-    Hasil eksekusi satu role.
-    """
+    """Hasil eksekusi satu role."""
 
     role: str
     success: bool
@@ -190,7 +150,6 @@ class RoleExecutionResult:
         }
 
 
-# Compatibility dengan API lama.
 RoleResult = RoleExecutionResult
 
 
@@ -199,9 +158,7 @@ RoleResult = RoleExecutionResult
 # ============================================================
 
 class RoleEngine:
-    """
-    Menjalankan satu AgentRole melalui GeminiAdapter.
-    """
+    """Menjalankan AgentRole melalui GeminiAdapter."""
 
     def __init__(
         self,
@@ -224,6 +181,9 @@ class RoleEngine:
         role: AgentRole | str,
     ) -> str:
 
+        if isinstance(role, AgentRole):
+            return role.name.strip().lower()
+
         value = getattr(
             role,
             "value",
@@ -233,6 +193,22 @@ class RoleEngine:
         return str(
             value
         ).strip().lower()
+
+    # ========================================================
+    # ROLE RESOLUTION
+    # ========================================================
+
+    @staticmethod
+    def _resolve_role(
+        role: AgentRole | str,
+    ) -> AgentRole:
+
+        if isinstance(role, AgentRole):
+            return role
+
+        return get_role(
+            RoleEngine._role_name(role)
+        )
 
     # ========================================================
     # PROMPT
@@ -246,7 +222,10 @@ class RoleEngine:
         previous_result: str = "",
     ) -> str:
         """
-        Membuat prompt terstruktur untuk role.
+        Membuat prompt role.
+
+        Seluruh identity, responsibility, constraint,
+        dan output contract berasal dari roles.py.
         """
 
         if not isinstance(task, str):
@@ -261,58 +240,27 @@ class RoleEngine:
                 "task tidak boleh kosong."
             )
 
-        role_name = RoleEngine._role_name(
+        role_definition = RoleEngine._resolve_role(
             role
         )
 
-        role_instructions = {
-            "planner": (
-                "Analisis task dan buat rencana implementasi "
-                "yang konkret. Identifikasi file yang relevan, "
-                "perubahan yang diperlukan, risiko, dan urutan kerja."
-            ),
-            "coder": (
-                "Implementasikan perubahan kode yang diperlukan. "
-                "Gunakan source code dan context yang tersedia. "
-                "Jangan mengarang API atau file yang tidak ada."
-            ),
-            "reviewer": (
-                "Review hasil pekerjaan secara kritis. "
-                "Cari bug, regression, security issue, "
-                "incorrect assumption, dan masalah correctness."
-            ),
-            "tester": (
-                "Validasi hasil implementasi. "
-                "Tentukan test yang relevan dan evaluasi "
-                "apakah perubahan benar-benar bekerja."
-            ),
-            "debugger": (
-                "Analisis kegagalan atau error secara sistematis. "
-                "Temukan root cause dan tentukan perbaikan yang tepat."
-            ),
-        }
-
-        instruction = role_instructions.get(
-            role_name,
-            (
-                "Kerjakan task sesuai tanggung jawab role "
-                "secara aman dan akurat."
-            ),
-        )
+        role_name = role_definition.name
 
         sections = [
             "SYNORA ROLE EXECUTION",
             "",
             f"ROLE: {role_name}",
             "",
-            "ROLE INSTRUCTION:",
-            instruction,
+            "ROLE DESCRIPTION:",
+            role_definition.description.strip(),
+            "",
+            role_definition.build_instruction(),
             "",
             "TASK:",
             task,
         ]
 
-        if context.strip():
+        if isinstance(context, str) and context.strip():
             sections.extend(
                 [
                     "",
@@ -321,7 +269,11 @@ class RoleEngine:
                 ]
             )
 
-        if previous_result.strip():
+        if isinstance(
+            previous_result,
+            str,
+        ) and previous_result.strip():
+
             sections.extend(
                 [
                     "",
@@ -338,28 +290,28 @@ class RoleEngine:
                 "- Jangan mengarang file atau API.",
                 "- Jika informasi tidak cukup, nyatakan dengan jelas.",
                 "- Jangan menampilkan API key atau secret.",
-                "- Fokus pada task yang diberikan.",
+                "- Jangan memperluas scope tanpa alasan.",
+                "- Bedakan fakta, asumsi, dan rekomendasi.",
+                "- Jangan mengklaim verification yang belum dilakukan.",
+                "- Fokus pada tanggung jawab role.",
                 "",
                 "RETURN:",
-                "Berikan hasil kerja yang konkret dan dapat "
-                "diteruskan ke role berikutnya.",
+                "Berikan hasil kerja yang konkret, terstruktur, "
+                "dan dapat diteruskan ke role berikutnya.",
             ]
         )
 
         return "\n".join(sections)
 
     # ========================================================
-    # GEMINI ADAPTER COMPATIBILITY
+    # GEMINI
     # ========================================================
 
     def _generate(
         self,
         prompt: str,
     ) -> str:
-        """
-        Memanggil GeminiAdapter menggunakan method API
-        yang tersedia.
-        """
+        """Memanggil GeminiAdapter dengan compatibility API."""
 
         candidates = (
             "generate",
@@ -381,9 +333,7 @@ class RoleEngine:
                 continue
 
             try:
-                result = method(
-                    prompt
-                )
+                result = method(prompt)
 
             except TypeError:
 
@@ -398,33 +348,19 @@ class RoleEngine:
             if result is None:
                 return ""
 
-            if isinstance(
-                result,
-                str,
-            ):
-                return clean_role_text(
-                    result
-                )
+            if isinstance(result, str):
+                return clean_role_text(result)
 
-            if hasattr(
+            text = getattr(
                 result,
                 "text",
-            ):
+                None,
+            )
 
-                text = getattr(
-                    result,
-                    "text",
-                )
+            if text is not None:
+                return clean_role_text(text)
 
-                if text is not None:
-                    return clean_role_text(
-                        text
-                    )
-
-            if isinstance(
-                result,
-                dict,
-            ):
+            if isinstance(result, dict):
 
                 for key in (
                     "text",
@@ -433,9 +369,7 @@ class RoleEngine:
                     "response",
                 ):
 
-                    candidate = result.get(
-                        key
-                    )
+                    candidate = result.get(key)
 
                     if candidate is not None:
                         return clean_role_text(
@@ -464,55 +398,89 @@ class RoleEngine:
         previous_result: str = "",
         memory_context: str = "",
     ) -> RoleExecutionResult:
-        """
-        Menjalankan satu role.
+        """Menjalankan satu role."""
 
-        memory_context didukung sebagai alias tambahan
-        untuk compatibility dengan AgentRuntime.
-        """
+        try:
+            role_definition = self._resolve_role(role)
 
-        role_name = self._role_name(
-            role
-        )
+        except (
+            TypeError,
+            ValueError,
+        ) as error:
 
-        if not role_name:
             return RoleExecutionResult(
-                role="unknown",
+                role=self._role_name(role) or "unknown",
                 success=False,
                 output="",
-                error="Role tidak valid.",
+                error=str(error),
+                metadata={
+                    "provider": "gemini",
+                    "role_resolved": False,
+                },
             )
 
-        # Gabungkan context biasa dengan memory context.
-        combined_context = context.strip()
+        role_name = role_definition.name
 
-        if memory_context.strip():
+        if not isinstance(task, str):
+            return RoleExecutionResult(
+                role=role_name,
+                success=False,
+                output="",
+                error="task harus string.",
+                metadata={
+                    "provider": "gemini",
+                    "role_resolved": True,
+                },
+            )
+
+        if not task.strip():
+            return RoleExecutionResult(
+                role=role_name,
+                success=False,
+                output="",
+                error="task tidak boleh kosong.",
+                metadata={
+                    "provider": "gemini",
+                    "role_resolved": True,
+                },
+            )
+
+        combined_context = (
+            context.strip()
+            if isinstance(context, str)
+            else str(context).strip()
+        )
+
+        memory_text = (
+            memory_context.strip()
+            if isinstance(memory_context, str)
+            else str(memory_context).strip()
+        )
+
+        if memory_text:
 
             if combined_context:
                 combined_context += (
                     "\n\n"
                     "MEMORY CONTEXT:\n"
-                    + memory_context.strip()
+                    + memory_text
                 )
 
             else:
                 combined_context = (
                     "MEMORY CONTEXT:\n"
-                    + memory_context.strip()
+                    + memory_text
                 )
 
         try:
-
             prompt = self.build_prompt(
-                role=role,
+                role=role_definition,
                 task=task,
                 context=combined_context,
                 previous_result=previous_result,
             )
 
-            output = self._generate(
-                prompt
-            )
+            output = self._generate(prompt)
 
             if not output:
                 return RoleExecutionResult(
@@ -523,7 +491,14 @@ class RoleEngine:
                         "Gemini mengembalikan "
                         "output kosong."
                     ),
+                    metadata={
+                        "provider": "gemini",
+                        "role_resolved": True,
+                        "prompt_generated": True,
+                    },
                 )
+
+            parsed_json = parse_json_result(output)
 
             return RoleExecutionResult(
                 role=role_name,
@@ -531,20 +506,20 @@ class RoleEngine:
                 output=output,
                 metadata={
                     "provider": "gemini",
+                    "role_resolved": True,
                     "prompt_generated": True,
                     "json_detected": (
-                        parse_json_result(output)
-                        is not None
+                        parsed_json is not None
+                    ),
+                    "role_priority": (
+                        role_definition.priority
                     ),
                 },
             )
 
         except Exception as error:
 
-            error_text = str(
-                error
-            )
-
+            error_text = str(error)
             lowered = error_text.lower()
 
             sensitive_markers = (
@@ -573,6 +548,7 @@ class RoleEngine:
                 error=error_text,
                 metadata={
                     "provider": "gemini",
+                    "role_resolved": True,
                 },
             )
 
