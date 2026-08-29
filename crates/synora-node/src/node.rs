@@ -19,6 +19,8 @@ pub enum NodeError {
     Mempool(MempoolError),
     Chain(ChainError),
     Consensus(ConsensusError),
+    ConsensusBlockRequired,
+    ConsensusBlockHashMismatch,
     NoTransactions,
     BlockGasLimitExceeded,
 }
@@ -46,6 +48,13 @@ pub struct SynoraNode {
     chain: Blockchain,
     mempool: Mempool,
     consensus: ConsensusEngine,
+
+    /*
+     * ConsensusEngine stores proposal metadata rather than the complete
+     * block. Keep the actual proposed block at the node layer so that a
+     * CommitDecision can be applied to the canonical blockchain.
+     */
+    consensus_block: Option<Block>,
 }
 
 #[allow(dead_code)]
@@ -78,6 +87,7 @@ impl SynoraNode {
             chain,
             mempool,
             consensus,
+            consensus_block: None,
         }
     }
 
@@ -140,6 +150,11 @@ impl SynoraNode {
     /// Returns the current consensus proposal.
     pub fn consensus_proposal(&self) -> Option<&BlockProposal> {
         self.consensus.proposal()
+    }
+
+    /// Returns the block currently associated with the consensus proposal.
+    pub fn consensus_block(&self) -> Option<&Block> {
+        self.consensus_block.as_ref()
     }
 
     /// Returns the commit decision if consensus has finalized a block.
@@ -212,10 +227,14 @@ impl SynoraNode {
         Ok(block)
     }
 
+    // ---------------------------------------------------------------------
+    // Consensus proposal / voting
+    // ---------------------------------------------------------------------
+
     /// Creates a proposal for the current consensus height.
     ///
-    /// The block itself is not committed to the chain. This method only
-    /// submits proposal metadata into the consensus state machine.
+    /// The block itself is retained at the node layer while only its
+    /// metadata is submitted to the consensus engine.
     pub fn submit_consensus_proposal(
         &mut self,
         block: &Block,
@@ -224,6 +243,8 @@ impl SynoraNode {
         let proposal = BlockProposal::new(block, round, self.config.validator_id);
 
         self.consensus.submit_proposal(proposal)?;
+
+        self.consensus_block = Some(block.clone());
 
         Ok(())
     }
@@ -255,8 +276,66 @@ impl SynoraNode {
         Ok(self.consensus.submit_precommit(validator)?)
     }
 
+    /// Finalize the block selected by a successful consensus decision.
+    ///
+    /// Consensus and blockchain execution are deliberately separated:
+    ///
+    /// 1. Consensus reaches `Committed`.
+    /// 2. The corresponding `CommitDecision` identifies the block hash.
+    /// 3. The stored proposal block is passed to `Blockchain::commit_block`.
+    /// 4. Only after successful execution and root validation is the block
+    ///    added to the canonical chain.
+    /// 5. The consensus engine is then initialized for the next height.
+    pub fn commit_consensus_block(&mut self) -> Result<Block, NodeError> {
+        if !self.consensus.is_committed() {
+            return Err(NodeError::Consensus(ConsensusError::InvalidConsensusPhase));
+        }
+
+        let decision = self
+            .consensus
+            .decision()
+            .ok_or(NodeError::Consensus(ConsensusError::InvalidConsensusPhase))?;
+
+        let block = self
+            .consensus_block
+            .clone()
+            .ok_or(NodeError::ConsensusBlockRequired)?;
+
+        if block.hash() != decision.block_hash {
+            return Err(NodeError::ConsensusBlockHashMismatch);
+        }
+
+        if block.header.height != decision.height {
+            return Err(NodeError::Consensus(ConsensusError::InvalidProposalHeight));
+        }
+
+        /*
+         * Blockchain::commit_block() executes every transaction against a
+         * working state and validates the block roots before mutating the
+         * canonical chain.
+         */
+        let committed = self.chain.commit_block(block)?;
+
+        /*
+         * Transactions are no longer pending after consensus finalization.
+         */
+        for transaction in &committed.transactions {
+            self.mempool.remove(&transaction.hash());
+        }
+
+        /*
+         * The committed consensus height is now part of the canonical chain.
+         * Start consensus for the next block height.
+         */
+        self.reset_consensus_for_next_height();
+
+        Ok(committed)
+    }
+
     /// Advance the consensus engine to the next round.
     pub fn advance_consensus_round(&mut self) -> Result<ConsensusRound, NodeError> {
+        self.consensus_block = None;
+
         Ok(self.consensus.advance_round()?)
     }
 
@@ -264,6 +343,7 @@ impl SynoraNode {
         let next_height = self.chain.height().saturating_add(1);
 
         self.consensus = ConsensusEngine::new(self.config.validator_set.clone(), next_height);
+        self.consensus_block = None;
     }
 
     // ---------------------------------------------------------------------
@@ -417,6 +497,7 @@ mod tests {
 
         assert_eq!(node.consensus_phase(), ConsensusPhase::Propose);
         assert!(!node.consensus_is_committed());
+        assert!(node.consensus_block().is_none());
     }
 
     #[test]
@@ -640,6 +721,130 @@ mod tests {
         assert_eq!(
             node.consensus_decision(),
             Some(CommitDecision::new(1, 0, proposal.block_hash))
+        );
+    }
+
+    #[test]
+    fn consensus_commit_finalizes_block_and_advances_height() {
+        let mut config = NodeConfig::devnet();
+
+        /*
+         * Validator 2 is the proposer for height 1, round 0.
+         * Configure this node to operate validator 2 so the normal
+         * submit_consensus_proposal() path can be tested end-to-end.
+         */
+        config.validator_id = [2u8; 20];
+
+        let mut node = SynoraNode::new(config, 1_700_000_000);
+
+        let block = Block::new(
+            1337,
+            1,
+            1_700_000_100,
+            node.chain().latest_block_hash(),
+            node.state().state_root(),
+            [0u8; 32],
+            Vec::new(),
+        );
+
+        node.submit_consensus_proposal(&block, 0)
+            .expect("proposal should be accepted");
+
+        assert_eq!(node.consensus_block(), Some(&block));
+
+        node.submit_prevote([1u8; 20])
+            .expect("first prevote should be accepted");
+
+        node.submit_prevote([2u8; 20])
+            .expect("second prevote should reach quorum");
+
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Precommit);
+
+        node.submit_precommit([1u8; 20])
+            .expect("first precommit should be accepted");
+
+        node.submit_precommit([2u8; 20])
+            .expect("second precommit should commit");
+
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Committed);
+
+        let decision = node
+            .consensus_decision()
+            .expect("consensus should have a commit decision");
+
+        assert_eq!(decision.height, 1);
+        assert_eq!(decision.round, 0);
+        assert_eq!(decision.block_hash, block.hash());
+
+        let committed = node
+            .commit_consensus_block()
+            .expect("consensus block should be committed");
+
+        assert_eq!(committed.hash(), block.hash());
+        assert_eq!(node.chain().height(), 1);
+        assert_eq!(node.chain().block_count(), 2);
+        assert_eq!(node.chain().latest_block_hash(), block.hash());
+
+        /*
+         * The committed consensus state is consumed and the engine now
+         * starts the next height.
+         */
+        assert_eq!(node.consensus_round(), ConsensusRound::new(2, 0));
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Propose);
+        assert!(!node.consensus_is_committed());
+        assert!(node.consensus_decision().is_none());
+        assert!(node.consensus_block().is_none());
+    }
+
+    #[test]
+    fn consensus_commit_requires_committed_phase() {
+        let config = NodeConfig::devnet();
+
+        let mut node = SynoraNode::new(config, 1_700_000_000);
+
+        assert_eq!(
+            node.commit_consensus_block(),
+            Err(NodeError::Consensus(ConsensusError::InvalidConsensusPhase))
+        );
+    }
+
+    #[test]
+    fn consensus_commit_rejects_missing_block() {
+        let config = NodeConfig::devnet();
+
+        let mut node = SynoraNode::new(config, 1_700_000_000);
+
+        let block = Block::new(
+            1337,
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            Vec::new(),
+        );
+
+        let proposal = BlockProposal::new(&block, 0, [2u8; 20]);
+
+        node.consensus_mut()
+            .submit_proposal(proposal)
+            .expect("proposal should be accepted");
+
+        node.submit_prevote([1u8; 20])
+            .expect("first prevote should be accepted");
+
+        node.submit_prevote([2u8; 20])
+            .expect("second prevote should reach quorum");
+
+        node.submit_precommit([1u8; 20])
+            .expect("first precommit should be accepted");
+
+        node.submit_precommit([2u8; 20])
+            .expect("second precommit should commit");
+
+        assert_eq!(
+            node.commit_consensus_block(),
+            Err(NodeError::ConsensusBlockRequired)
         );
     }
 
