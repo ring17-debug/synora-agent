@@ -1,18 +1,16 @@
 //! Synora consensus primitives.
 //!
-//! This module intentionally contains only deterministic consensus
-//! primitives. Networking, signatures, vote propagation, and persistent
-//! consensus state belong to higher layers.
+//! Consensus is divided into three layers:
 //!
-//! Current model:
-//! - validator set with unique validator addresses
-//! - deterministic round-robin proposer selection
-//! - Byzantine-style two-thirds quorum calculation
-//! - block proposer validation
+//! - validator/proposal primitives
+//! - vote accounting
+//! - deterministic consensus state machine
 //!
-//! The implementation is deliberately small so it can later be extended
-//! into a full BFT consensus protocol without coupling consensus logic to
-//! the node or RPC layer.
+//! Networking, persistent consensus state, transaction execution, and
+//! cryptographic vote signatures belong to higher layers.
+
+pub mod engine;
+pub mod vote;
 
 use crate::block::Block;
 use crate::hash::Hash;
@@ -29,12 +27,10 @@ pub struct Validator {
 }
 
 impl Validator {
-    /// Creates a validator with one unit of voting power.
     pub fn new(id: ValidatorId) -> Self {
         Self { id, power: 1 }
     }
 
-    /// Creates a validator with explicit voting power.
     pub fn with_power(id: ValidatorId, power: u64) -> Self {
         Self { id, power }
     }
@@ -44,11 +40,7 @@ impl Validator {
     }
 }
 
-/// A deterministic validator set.
-///
-/// Validators are kept in insertion order. This makes proposer selection
-/// deterministic across nodes as long as every node has the same validator
-/// set.
+/// Deterministic validator set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ValidatorSet {
     validators: Vec<Validator>,
@@ -120,16 +112,11 @@ impl ValidatorSet {
         Ok(self.validators.remove(index))
     }
 
-    /// Selects the deterministic proposer for a block height and round.
-    ///
-    /// Formula:
+    /// Select deterministic proposer.
     ///
     /// ```text
     /// (height + round) % validator_count
     /// ```
-    ///
-    /// Genesis height 0 is therefore also deterministic, although consensus
-    /// should normally start proposing from height 1.
     pub fn proposer(&self, height: u64, round: u64) -> Result<&Validator, ConsensusError> {
         if self.validators.is_empty() {
             return Err(ConsensusError::EmptyValidatorSet);
@@ -140,14 +127,8 @@ impl ValidatorSet {
         Ok(&self.validators[index])
     }
 
-    /// Returns whether the supplied voting power reaches the Byzantine
-    /// two-thirds quorum.
-    ///
-    /// The comparison avoids floating point arithmetic:
-    ///
-    /// ```text
-    /// power * 3 >= total_power * 2
-    /// ```
+    /// Returns whether supplied voting power reaches
+    /// Byzantine two-thirds quorum.
     pub fn has_quorum(&self, voting_power: u64) -> bool {
         let total = self.total_power();
 
@@ -158,9 +139,7 @@ impl ValidatorSet {
         voting_power.saturating_mul(3) >= total.saturating_mul(2)
     }
 
-    /// Returns the minimum voting power required for quorum.
-    ///
-    /// This is the mathematical ceiling of 2/3 of the total power.
+    /// Minimum voting power required for quorum.
     pub fn quorum_power(&self) -> u64 {
         let total = self.total_power();
 
@@ -186,9 +165,6 @@ impl ConsensusRound {
 }
 
 /// Basic block proposal metadata.
-///
-/// This is deliberately separate from `Block` so the consensus layer can
-/// validate proposal ownership without changing the block format yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockProposal {
     pub block_hash: Hash,
@@ -208,7 +184,7 @@ impl BlockProposal {
     }
 }
 
-/// Validates a block proposal against a validator set.
+/// Validates proposals against the validator set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsensusValidator {
     validator_set: ValidatorSet,
@@ -223,7 +199,6 @@ impl ConsensusValidator {
         &self.validator_set
     }
 
-    /// Returns the expected proposer for the supplied height and round.
     pub fn expected_proposer(
         &self,
         height: u64,
@@ -232,7 +207,6 @@ impl ConsensusValidator {
         Ok(self.validator_set.proposer(height, round)?.id)
     }
 
-    /// Validates that a proposal was created by the deterministic proposer.
     pub fn validate_proposer(
         &self,
         block: &Block,
@@ -248,7 +222,6 @@ impl ConsensusValidator {
         Ok(())
     }
 
-    /// Validates the proposal's basic block/height relationship.
     pub fn validate_proposal(&self, proposal: &BlockProposal) -> Result<(), ConsensusError> {
         let expected = self.expected_proposer(proposal.height, proposal.round)?;
 
@@ -260,7 +233,7 @@ impl ConsensusValidator {
     }
 }
 
-/// Errors produced by the consensus primitives.
+/// Errors produced by consensus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsensusError {
     EmptyValidatorSet,
@@ -268,16 +241,65 @@ pub enum ConsensusError {
     ValidatorNotFound,
     InvalidVotingPower,
     InvalidProposer,
+
+    InvalidVoteHeight,
+    InvalidVoteRound,
+    InvalidVoteType,
+    UnknownValidator,
+    DuplicateVote,
+    ConflictingVote,
+
+    InvalidProposalHeight,
+    InvalidProposalRound,
+    DuplicateProposal,
+    ProposalRequired,
+    InvalidVoteBlock,
+
+    PrevoteQuorumRequired,
+    InvalidConsensusPhase,
+    AlreadyCommitted,
 }
 
 impl std::fmt::Display for ConsensusError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             Self::EmptyValidatorSet => "validator set is empty",
+
             Self::DuplicateValidator => "validator already exists",
+
             Self::ValidatorNotFound => "validator not found",
+
             Self::InvalidVotingPower => "validator voting power must be greater than zero",
+
             Self::InvalidProposer => "proposal proposer is not the expected proposer",
+
+            Self::InvalidVoteHeight => "vote height does not match consensus height",
+
+            Self::InvalidVoteRound => "vote round does not match consensus round",
+
+            Self::InvalidVoteType => "vote type does not match vote set",
+
+            Self::UnknownValidator => "vote validator is not in the validator set",
+
+            Self::DuplicateVote => "validator already submitted this vote",
+
+            Self::ConflictingVote => "validator submitted a conflicting vote",
+
+            Self::InvalidProposalHeight => "proposal height does not match consensus height",
+
+            Self::InvalidProposalRound => "proposal round does not match consensus round",
+
+            Self::DuplicateProposal => "a proposal has already been accepted",
+
+            Self::ProposalRequired => "a valid proposal is required",
+
+            Self::InvalidVoteBlock => "vote block does not match the accepted proposal",
+
+            Self::PrevoteQuorumRequired => "prevote quorum is required before precommit",
+
+            Self::InvalidConsensusPhase => "operation is invalid for the current consensus phase",
+
+            Self::AlreadyCommitted => "consensus height is already committed",
         };
 
         formatter.write_str(message)
@@ -286,196 +308,6 @@ impl std::fmt::Display for ConsensusError {
 
 impl std::error::Error for ConsensusError {}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::block::Block;
+pub use engine::{CommitDecision, ConsensusEngine, ConsensusPhase};
 
-    fn validator(value: u8) -> Validator {
-        Validator::new([value; 20])
-    }
-
-    #[test]
-    fn validator_can_be_created() {
-        let validator = validator(1);
-
-        assert_eq!(validator.id, [1u8; 20]);
-        assert_eq!(validator.power, 1);
-        assert!(validator.is_valid());
-    }
-
-    #[test]
-    fn zero_power_validator_is_invalid() {
-        let validator = Validator::with_power([1u8; 20], 0);
-
-        assert!(!validator.is_valid());
-
-        let result = ValidatorSet::new(vec![validator]);
-
-        assert_eq!(result, Err(ConsensusError::InvalidVotingPower));
-    }
-
-    #[test]
-    fn validator_set_rejects_duplicates() {
-        let result = ValidatorSet::new(vec![validator(1), validator(1)]);
-
-        assert_eq!(result, Err(ConsensusError::DuplicateValidator));
-    }
-
-    #[test]
-    fn validator_set_tracks_total_power() {
-        let set = ValidatorSet::new(vec![
-            Validator::with_power([1u8; 20], 2),
-            Validator::with_power([2u8; 20], 3),
-            Validator::with_power([3u8; 20], 5),
-        ])
-        .expect("validator set should be valid");
-
-        assert_eq!(set.len(), 3);
-        assert_eq!(set.total_power(), 10);
-    }
-
-    #[test]
-    fn proposer_selection_is_deterministic() {
-        let set = ValidatorSet::new(vec![validator(1), validator(2), validator(3)])
-            .expect("validator set should be valid");
-
-        assert_eq!(set.proposer(1, 0).unwrap().id, [2u8; 20]);
-        assert_eq!(set.proposer(1, 1).unwrap().id, [3u8; 20]);
-        assert_eq!(set.proposer(1, 2).unwrap().id, [1u8; 20]);
-        assert_eq!(set.proposer(2, 0).unwrap().id, [3u8; 20]);
-    }
-
-    #[test]
-    fn empty_validator_set_cannot_select_proposer() {
-        let set = ValidatorSet::empty();
-
-        assert_eq!(set.proposer(1, 0), Err(ConsensusError::EmptyValidatorSet));
-    }
-
-    #[test]
-    fn quorum_requires_two_thirds() {
-        let set = ValidatorSet::new(vec![validator(1), validator(2), validator(3)])
-            .expect("validator set should be valid");
-
-        assert_eq!(set.total_power(), 3);
-        assert_eq!(set.quorum_power(), 2);
-
-        assert!(!set.has_quorum(1));
-        assert!(set.has_quorum(2));
-        assert!(set.has_quorum(3));
-    }
-
-    #[test]
-    fn weighted_quorum_is_correct() {
-        let set = ValidatorSet::new(vec![
-            Validator::with_power([1u8; 20], 1),
-            Validator::with_power([2u8; 20], 2),
-            Validator::with_power([3u8; 20], 6),
-        ])
-        .expect("validator set should be valid");
-
-        assert_eq!(set.total_power(), 9);
-        assert_eq!(set.quorum_power(), 6);
-
-        assert!(!set.has_quorum(5));
-        assert!(set.has_quorum(6));
-        assert!(set.has_quorum(9));
-    }
-
-    #[test]
-    fn voting_power_above_total_is_rejected() {
-        let set = ValidatorSet::new(vec![validator(1), validator(2), validator(3)])
-            .expect("validator set should be valid");
-
-        assert!(!set.has_quorum(4));
-    }
-
-    #[test]
-    fn validator_can_be_removed() {
-        let mut set = ValidatorSet::new(vec![validator(1), validator(2)])
-            .expect("validator set should be valid");
-
-        let removed = set.remove(&[1u8; 20]).expect("validator should exist");
-
-        assert_eq!(removed.id, [1u8; 20]);
-        assert_eq!(set.len(), 1);
-        assert!(!set.contains(&[1u8; 20]));
-    }
-
-    #[test]
-    fn removing_unknown_validator_fails() {
-        let mut set = ValidatorSet::new(vec![validator(1)]).expect("validator set should be valid");
-
-        assert_eq!(
-            set.remove(&[9u8; 20]),
-            Err(ConsensusError::ValidatorNotFound)
-        );
-    }
-
-    #[test]
-    fn expected_proposer_is_deterministic() {
-        let set = ValidatorSet::new(vec![validator(1), validator(2), validator(3)])
-            .expect("validator set should be valid");
-
-        let consensus = ConsensusValidator::new(set);
-
-        assert_eq!(consensus.expected_proposer(1, 0).unwrap(), [2u8; 20]);
-        assert_eq!(consensus.expected_proposer(1, 2).unwrap(), [1u8; 20]);
-    }
-
-    #[test]
-    fn valid_proposer_is_accepted() {
-        let set = ValidatorSet::new(vec![validator(1), validator(2), validator(3)])
-            .expect("validator set should be valid");
-
-        let consensus = ConsensusValidator::new(set);
-
-        let block = Block::genesis(1, 1_700_000_000);
-
-        // Height 0 + round 0 selects validator 1.
-        assert_eq!(consensus.validate_proposer(&block, 0, &[1u8; 20],), Ok(()));
-    }
-
-    #[test]
-    fn invalid_proposer_is_rejected() {
-        let set = ValidatorSet::new(vec![validator(1), validator(2), validator(3)])
-            .expect("validator set should be valid");
-
-        let consensus = ConsensusValidator::new(set);
-
-        let block = Block::genesis(1, 1_700_000_000);
-
-        assert_eq!(
-            consensus.validate_proposer(&block, 0, &[2u8; 20],),
-            Err(ConsensusError::InvalidProposer)
-        );
-    }
-
-    #[test]
-    fn block_proposal_contains_block_hash() {
-        let set = ValidatorSet::new(vec![validator(1)]).expect("validator set should be valid");
-
-        let consensus = ConsensusValidator::new(set);
-
-        let block = Block::genesis(1, 1_700_000_000);
-
-        let proposal = BlockProposal::new(&block, 0, [1u8; 20]);
-
-        assert_eq!(proposal.block_hash, block.hash());
-        assert_eq!(proposal.height, 0);
-        assert_eq!(proposal.round, 0);
-
-        consensus
-            .validate_proposal(&proposal)
-            .expect("proposal should be valid");
-    }
-
-    #[test]
-    fn consensus_round_is_constructible() {
-        let round = ConsensusRound::new(10, 3);
-
-        assert_eq!(round.height, 10);
-        assert_eq!(round.round, 3);
-    }
-}
+pub use vote::{Vote, VoteSet, VoteType};

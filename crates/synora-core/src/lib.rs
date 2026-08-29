@@ -2,6 +2,7 @@ pub const SYNORA_VERSION: &str = "0.1.0";
 
 pub mod block;
 pub mod chain;
+pub mod consensus;
 pub mod crypto;
 pub mod execution;
 pub mod hash;

@@ -3,6 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use synora_core::{
     block::Block,
     chain::{Blockchain, ChainError},
+    consensus::{
+        BlockProposal, CommitDecision, ConsensusEngine, ConsensusError, ConsensusPhase,
+        ConsensusRound, ValidatorId,
+    },
     mempool::{Mempool, MempoolError},
     state::{Address, State},
     transaction::Transaction,
@@ -14,6 +18,7 @@ use crate::config::NodeConfig;
 pub enum NodeError {
     Mempool(MempoolError),
     Chain(ChainError),
+    Consensus(ConsensusError),
     NoTransactions,
     BlockGasLimitExceeded,
 }
@@ -30,10 +35,17 @@ impl From<ChainError> for NodeError {
     }
 }
 
+impl From<ConsensusError> for NodeError {
+    fn from(error: ConsensusError) -> Self {
+        Self::Consensus(error)
+    }
+}
+
 pub struct SynoraNode {
     config: NodeConfig,
     chain: Blockchain,
     mempool: Mempool,
+    consensus: ConsensusEngine,
 }
 
 #[allow(dead_code)]
@@ -50,10 +62,22 @@ impl SynoraNode {
 
         let mempool = Mempool::new(config.chain_id, config.mempool_capacity);
 
+        /*
+         * Genesis is height 0.
+         *
+         * The first consensus round therefore starts at height 1,
+         * which is the first block that validators need to agree on.
+         */
+        let consensus = ConsensusEngine::new(
+            config.validator_set.clone(),
+            chain.height().saturating_add(1),
+        );
+
         Self {
             config,
             chain,
             mempool,
+            consensus,
         }
     }
 
@@ -89,6 +113,59 @@ impl SynoraNode {
         self.chain.state()
     }
 
+    // ---------------------------------------------------------------------
+    // Consensus accessors
+    // ---------------------------------------------------------------------
+
+    /// Returns the validator set used by this node.
+    pub fn validator_set(&self) -> &synora_core::consensus::ValidatorSet {
+        self.consensus.validator_set()
+    }
+
+    /// Returns this node's validator identity.
+    pub fn validator_id(&self) -> ValidatorId {
+        self.config.validator_id
+    }
+
+    /// Returns the current consensus round.
+    pub fn consensus_round(&self) -> ConsensusRound {
+        self.consensus.round()
+    }
+
+    /// Returns the current consensus phase.
+    pub fn consensus_phase(&self) -> ConsensusPhase {
+        self.consensus.phase()
+    }
+
+    /// Returns the current consensus proposal.
+    pub fn consensus_proposal(&self) -> Option<&BlockProposal> {
+        self.consensus.proposal()
+    }
+
+    /// Returns the commit decision if consensus has finalized a block.
+    pub fn consensus_decision(&self) -> Option<CommitDecision> {
+        self.consensus.decision()
+    }
+
+    /// Returns whether consensus has committed the current height.
+    pub fn consensus_is_committed(&self) -> bool {
+        self.consensus.is_committed()
+    }
+
+    /// Returns a reference to the underlying consensus engine.
+    pub fn consensus(&self) -> &ConsensusEngine {
+        &self.consensus
+    }
+
+    /// Returns a mutable reference to the underlying consensus engine.
+    pub fn consensus_mut(&mut self) -> &mut ConsensusEngine {
+        &mut self.consensus
+    }
+
+    // ---------------------------------------------------------------------
+    // Transactions / mempool
+    // ---------------------------------------------------------------------
+
     pub fn submit_transaction(&mut self, tx: Transaction) -> Result<(), NodeError> {
         let state = self.chain.state();
 
@@ -100,6 +177,10 @@ impl SynoraNode {
     pub fn pending_transactions(&self) -> usize {
         self.mempool.len()
     }
+
+    // ---------------------------------------------------------------------
+    // Block production
+    // ---------------------------------------------------------------------
 
     pub fn produce_block(&mut self, timestamp: Option<u64>) -> Result<Block, NodeError> {
         if self.mempool.is_empty() {
@@ -120,8 +201,74 @@ impl SynoraNode {
             self.mempool.remove(&transaction.hash());
         }
 
+        /*
+         * The block has now been committed to the local chain.
+         *
+         * The consensus engine represents the consensus state for the
+         * next block height, so reset it after local block production.
+         */
+        self.reset_consensus_for_next_height();
+
         Ok(block)
     }
+
+    /// Creates a proposal for the current consensus height.
+    ///
+    /// The block itself is not committed to the chain. This method only
+    /// submits proposal metadata into the consensus state machine.
+    pub fn submit_consensus_proposal(
+        &mut self,
+        block: &Block,
+        round: u64,
+    ) -> Result<(), NodeError> {
+        let proposal = BlockProposal::new(block, round, self.config.validator_id);
+
+        self.consensus.submit_proposal(proposal)?;
+
+        Ok(())
+    }
+
+    /// Submit this node's prevote for the current proposal.
+    pub fn submit_own_prevote(&mut self) -> Result<ConsensusPhase, NodeError> {
+        Ok(self.consensus.submit_prevote(self.config.validator_id)?)
+    }
+
+    /// Submit this node's precommit for the current proposal.
+    pub fn submit_own_precommit(&mut self) -> Result<ConsensusPhase, NodeError> {
+        Ok(self.consensus.submit_precommit(self.config.validator_id)?)
+    }
+
+    /// Submit another validator's prevote.
+    ///
+    /// Networking/signature verification will eventually live above this
+    /// layer. At this stage the deterministic consensus engine validates the
+    /// validator identity and vote consistency.
+    pub fn submit_prevote(&mut self, validator: ValidatorId) -> Result<ConsensusPhase, NodeError> {
+        Ok(self.consensus.submit_prevote(validator)?)
+    }
+
+    /// Submit another validator's precommit.
+    pub fn submit_precommit(
+        &mut self,
+        validator: ValidatorId,
+    ) -> Result<ConsensusPhase, NodeError> {
+        Ok(self.consensus.submit_precommit(validator)?)
+    }
+
+    /// Advance the consensus engine to the next round.
+    pub fn advance_consensus_round(&mut self) -> Result<ConsensusRound, NodeError> {
+        Ok(self.consensus.advance_round()?)
+    }
+
+    fn reset_consensus_for_next_height(&mut self) {
+        let next_height = self.chain.height().saturating_add(1);
+
+        self.consensus = ConsensusEngine::new(self.config.validator_set.clone(), next_height);
+    }
+
+    // ---------------------------------------------------------------------
+    // Accounts / transactions
+    // ---------------------------------------------------------------------
 
     pub fn create_account(&mut self, address: Address, balance: u128) {
         self.chain.state_mut().create_account(address, balance);
@@ -261,6 +408,26 @@ mod tests {
         assert_eq!(node.chain_id(), 1337);
         assert_eq!(node.chain().height(), 0);
         assert_eq!(node.pending_transactions(), 0);
+
+        assert_eq!(node.validator_set().len(), 3);
+        assert_eq!(node.validator_set().total_power(), 3);
+        assert_eq!(node.validator_id(), [1u8; 20]);
+
+        assert_eq!(node.consensus_round(), ConsensusRound::new(1, 0));
+
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Propose);
+        assert!(!node.consensus_is_committed());
+    }
+
+    #[test]
+    fn consensus_engine_is_initialized_for_next_block_height() {
+        let config = NodeConfig::devnet();
+
+        let node = SynoraNode::new(config, 1_700_000_000);
+
+        assert_eq!(node.chain().height(), 0);
+        assert_eq!(node.consensus_round().height, 1);
+        assert_eq!(node.consensus_round().round, 0);
     }
 
     #[test]
@@ -300,6 +467,146 @@ mod tests {
         assert_eq!(
             node.state().get_account(&[0xFE; 20]).unwrap().balance,
             21_000
+        );
+
+        /*
+         * Local block production advances the consensus height.
+         */
+        assert_eq!(node.consensus_round(), ConsensusRound::new(2, 0));
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Propose);
+    }
+
+    #[test]
+    fn consensus_proposal_is_accepted_for_current_height() {
+        let config = NodeConfig::devnet();
+
+        let mut node = SynoraNode::new(config, 1_700_000_000);
+
+        let block = Block::genesis(1337, 1_700_000_100);
+
+        /*
+         * At height 0, validator 1 is the proposer for round 0.
+         */
+        node.submit_consensus_proposal(&block, 0)
+            .expect("proposal should be accepted");
+
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Prevote);
+        assert_eq!(node.consensus_proposal().unwrap().proposer, [1u8; 20]);
+        assert_eq!(node.consensus_proposal().unwrap().height, 0);
+    }
+
+    #[test]
+    fn consensus_proposal_must_match_engine_height() {
+        let config = NodeConfig::devnet();
+
+        let mut node = SynoraNode::new(config, 1_700_000_000);
+
+        let block = Block::genesis(1337, 1_700_000_100);
+
+        let result = node.submit_consensus_proposal(&block, 0);
+
+        assert_eq!(
+            result,
+            Err(NodeError::Consensus(ConsensusError::InvalidProposalHeight))
+        );
+    }
+
+    #[test]
+    fn own_prevote_requires_proposal() {
+        let config = NodeConfig::devnet();
+
+        let mut node = SynoraNode::new(config, 1_700_000_000);
+
+        assert_eq!(
+            node.submit_own_prevote(),
+            Err(NodeError::Consensus(ConsensusError::ProposalRequired))
+        );
+    }
+
+    #[test]
+    fn consensus_can_reach_precommit_phase() {
+        let config = NodeConfig::devnet();
+
+        let mut node = SynoraNode::new(config, 1_700_000_000);
+
+        /*
+         * Build a proposal for height 1.
+         *
+         * Validator 2 is the deterministic proposer for height 1,
+         * round 0 under the current round-robin formula:
+         *
+         *     (1 + 0) % 3 = 1
+         */
+        let mut proposal_block = Block::genesis(1337, 1_700_000_100);
+
+        /*
+         * The engine requires validator 2 to be the proposer, so use
+         * the proposal metadata directly here.
+         */
+        let proposal = BlockProposal::new(&proposal_block, 0, [2u8; 20]);
+
+        node.consensus_mut()
+            .submit_proposal(proposal)
+            .expect("proposal should be accepted");
+
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Prevote);
+
+        node.submit_prevote([1u8; 20])
+            .expect("first prevote should be accepted");
+
+        assert_eq!(
+            node.submit_prevote([2u8; 20])
+                .expect("second prevote should reach quorum"),
+            ConsensusPhase::Precommit
+        );
+
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Precommit);
+
+        /*
+         * Avoid an unused mut warning while keeping the block explicit
+         * for the test's purpose.
+         */
+        proposal_block = Block::genesis(1337, 1_700_000_100);
+        assert_eq!(proposal_block.header.height, 0);
+    }
+
+    #[test]
+    fn consensus_can_commit_block() {
+        let config = NodeConfig::devnet();
+
+        let mut node = SynoraNode::new(config, 1_700_000_000);
+
+        /*
+         * The first consensus height is 1, therefore validator 2
+         * is the proposer at round 0.
+         */
+        let block = Block::genesis(1337, 1_700_000_100);
+
+        let proposal = BlockProposal::new(&block, 0, [2u8; 20]);
+
+        node.consensus_mut()
+            .submit_proposal(proposal.clone())
+            .expect("proposal should be accepted");
+
+        node.submit_prevote([1u8; 20])
+            .expect("first prevote should be accepted");
+
+        node.submit_prevote([2u8; 20])
+            .expect("second prevote should reach quorum");
+
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Precommit);
+
+        node.submit_precommit([1u8; 20])
+            .expect("first precommit should be accepted");
+
+        node.submit_precommit([2u8; 20])
+            .expect("second precommit should commit");
+
+        assert_eq!(node.consensus_phase(), ConsensusPhase::Committed);
+
+        assert_eq!(
+            node.consensus_decision(),
+            Some(CommitDecision::new(1, 0, proposal.block_hash))
         );
     }
 
