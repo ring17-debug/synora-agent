@@ -7,6 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use synora_core::{
     block::Block,
+    consensus::engine::ConsensusPhase,
     hash::Hash,
     state::Address,
     transaction::{Transaction, PUBLIC_KEY_SIZE, SIGNATURE_SIZE},
@@ -65,6 +66,44 @@ struct StatusResponse {
     height: u64,
     pending_transactions: usize,
     latest_block_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsensusResponse {
+    height: u64,
+    round: u64,
+    phase: &'static str,
+    committed: bool,
+    validator_count: usize,
+    total_voting_power: u64,
+    quorum_power: u64,
+    proposal: Option<ConsensusProposalResponse>,
+    prevotes: ConsensusVoteSummary,
+    precommits: ConsensusVoteSummary,
+    decision: Option<ConsensusDecisionResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsensusProposalResponse {
+    block_hash: String,
+    height: u64,
+    round: u64,
+    proposer: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsensusVoteSummary {
+    count: usize,
+    voting_power: u64,
+    quorum: bool,
+    block_hash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsensusDecisionResponse {
+    height: u64,
+    round: u64,
+    block_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -379,6 +418,19 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
             )
         }
 
+        ("GET", "/consensus") => {
+            let response = consensus_to_json(node);
+
+            send_json_response(
+                stream,
+                200,
+                &RpcResponse {
+                    status: "ok",
+                    result: response,
+                },
+            )
+        }
+
         ("GET", "/state/root") => {
             let response = serde_json::json!({
                 "root": encode_hex(&node.state().state_root()),
@@ -437,13 +489,6 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
         }
 
         ("GET", "/mempool") => {
-            /*
-             * `transactions()` returns references to transactions.
-             * Calling `.iter()` therefore produces &&Transaction.
-             *
-             * Use a closure so the compiler performs the required
-             * dereference automatically.
-             */
             let transactions = node
                 .mempool()
                 .transactions()
@@ -651,6 +696,69 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
     }
 }
 
+fn consensus_to_json(node: &SynoraNode) -> ConsensusResponse {
+    let consensus = node.consensus();
+    let round = consensus.round();
+    let validators = consensus.validator_set();
+
+    let proposal = consensus
+        .proposal()
+        .map(|proposal| ConsensusProposalResponse {
+            block_hash: encode_hex(&proposal.block_hash),
+            height: proposal.height,
+            round: proposal.round,
+            proposer: encode_hex(&proposal.proposer),
+        });
+
+    let prevotes = consensus.prevotes();
+    let precommits = consensus.precommits();
+
+    let prevote_summary = ConsensusVoteSummary {
+        count: prevotes.len(),
+        voting_power: prevotes.voting_power(validators),
+        quorum: prevotes.has_quorum(validators),
+        block_hash: prevotes.block_hash().map(|hash| encode_hex(&hash)),
+    };
+
+    let precommit_summary = ConsensusVoteSummary {
+        count: precommits.len(),
+        voting_power: precommits.voting_power(validators),
+        quorum: precommits.has_quorum(validators),
+        block_hash: precommits.block_hash().map(|hash| encode_hex(&hash)),
+    };
+
+    let decision = consensus
+        .decision()
+        .map(|decision| ConsensusDecisionResponse {
+            height: decision.height,
+            round: decision.round,
+            block_hash: encode_hex(&decision.block_hash),
+        });
+
+    ConsensusResponse {
+        height: round.height,
+        round: round.round,
+        phase: consensus_phase_name(consensus.phase()),
+        committed: consensus.is_committed(),
+        validator_count: validators.len(),
+        total_voting_power: validators.total_power(),
+        quorum_power: validators.quorum_power(),
+        proposal,
+        prevotes: prevote_summary,
+        precommits: precommit_summary,
+        decision,
+    }
+}
+
+fn consensus_phase_name(phase: ConsensusPhase) -> &'static str {
+    match phase {
+        ConsensusPhase::Propose => "propose",
+        ConsensusPhase::Prevote => "prevote",
+        ConsensusPhase::Precommit => "precommit",
+        ConsensusPhase::Committed => "committed",
+    }
+}
+
 fn node_error_response(error: &NodeError) -> (&'static str, u16) {
     match error {
         NodeError::Mempool(mempool_error) => match mempool_error {
@@ -683,12 +791,6 @@ fn node_error_response(error: &NodeError) -> (&'static str, u16) {
 
         NodeError::Consensus(_) => ("CONSENSUS_ERROR", 400),
 
-        /*
-         * A consensus commit requires the block itself.
-         *
-         * These are node-level validation errors rather than consensus
-         * engine errors, so expose stable RPC error codes for them.
-         */
         NodeError::ConsensusBlockRequired => ("CONSENSUS_BLOCK_REQUIRED", 400),
 
         NodeError::ConsensusBlockHashMismatch => ("CONSENSUS_BLOCK_HASH_MISMATCH", 400),
@@ -762,11 +864,6 @@ fn block_to_json(block: &Block) -> BlockResponse {
         state_root: encode_hex(&block.header.state_root),
         transactions_root: encode_hex(&block.header.transactions_root),
         transaction_count: block.transactions.len(),
-
-        /*
-         * Here `.iter()` yields &Transaction directly, so the function
-         * can be passed without an additional closure.
-         */
         transactions: block.transactions.iter().map(transaction_to_json).collect(),
     }
 }
@@ -1018,6 +1115,41 @@ mod tests {
         assert!(json.contains("\"transactions_root\":"));
         assert!(json.contains("\"transaction_count\":0"));
         assert!(json.contains("\"transactions\":[]"));
+    }
+
+    #[test]
+    fn consensus_response_starts_at_propose_phase() {
+        let config = crate::config::NodeConfig::devnet();
+
+        let node = SynoraNode::new(config, 1_700_000_000);
+
+        let response = consensus_to_json(&node);
+
+        assert_eq!(response.height, 1);
+        assert_eq!(response.round, 0);
+        assert_eq!(response.phase, "propose");
+        assert!(!response.committed);
+        assert_eq!(response.validator_count, 3);
+        assert_eq!(response.total_voting_power, 3);
+        assert_eq!(response.quorum_power, 2);
+        assert!(response.proposal.is_none());
+        assert_eq!(response.prevotes.count, 0);
+        assert_eq!(response.prevotes.voting_power, 0);
+        assert!(!response.prevotes.quorum);
+        assert!(response.prevotes.block_hash.is_none());
+        assert_eq!(response.precommits.count, 0);
+        assert_eq!(response.precommits.voting_power, 0);
+        assert!(!response.precommits.quorum);
+        assert!(response.precommits.block_hash.is_none());
+        assert!(response.decision.is_none());
+    }
+
+    #[test]
+    fn consensus_phase_names_are_stable() {
+        assert_eq!(consensus_phase_name(ConsensusPhase::Propose), "propose");
+        assert_eq!(consensus_phase_name(ConsensusPhase::Prevote), "prevote");
+        assert_eq!(consensus_phase_name(ConsensusPhase::Precommit), "precommit");
+        assert_eq!(consensus_phase_name(ConsensusPhase::Committed), "committed");
     }
 
     #[test]
