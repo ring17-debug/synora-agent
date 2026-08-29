@@ -11,6 +11,8 @@ pub enum ChainError {
     InvalidHeight,
     InvalidPreviousHash,
     InvalidTimestamp,
+    InvalidStateRoot,
+    InvalidTransactionsRoot,
     ExecutionFailed(ExecutionError),
 }
 
@@ -132,6 +134,47 @@ impl Blockchain {
         /*
          * Commit only after every transaction and root calculation succeeds.
          */
+        self.state = working_state;
+        self.blocks.push(block.clone());
+
+        Ok(block)
+    }
+
+    /*
+     * Commit an already-constructed block.
+     *
+     * This is intentionally different from produce_block().
+     *
+     * produce_block() creates a new block locally, while commit_block()
+     * accepts a block that has already been agreed upon by consensus.
+     *
+     * The block is executed against a working state first. Only after
+     * every transaction succeeds and both Merkle roots match the block
+     * header do we mutate the canonical chain.
+     */
+    pub fn commit_block(&mut self, block: Block) -> Result<Block, ChainError> {
+        self.verify_block_link(&block)?;
+
+        if !block.validate_transactions_root() {
+            return Err(ChainError::InvalidTransactionsRoot);
+        }
+
+        let mut working_state = self.state.clone();
+
+        for tx in &block.transactions {
+            if tx.chain_id != self.chain_id {
+                return Err(ChainError::InvalidChainId);
+            }
+
+            self.executor
+                .execute(&mut working_state, tx)
+                .map_err(ChainError::ExecutionFailed)?;
+        }
+
+        if !block.validate_state_root(&working_state) {
+            return Err(ChainError::InvalidStateRoot);
+        }
+
         self.state = working_state;
         self.blocks.push(block.clone());
 
@@ -322,6 +365,177 @@ mod tests {
             .expect("block should be produced");
 
         assert_eq!(block.header.previous_hash, chain.block(0).unwrap().hash());
+    }
+
+    #[test]
+    fn committed_external_block_is_accepted() {
+        let mut chain = create_chain();
+
+        let (_, bob, fee_recipient) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
+
+        let tx = transaction(1, 0, &alice_keypair, bob, 10_000);
+
+        /*
+         * Construct exactly the block that consensus would have agreed
+         * upon. The state root is calculated from a working state.
+         */
+        let mut working_state = chain.state().clone();
+
+        chain
+            .executor
+            .execute(&mut working_state, &tx)
+            .expect("transaction should execute");
+
+        let block = Block::from_state(
+            1,
+            1,
+            1_700_000_100,
+            chain.latest_block_hash(),
+            &working_state,
+            vec![tx],
+        );
+
+        let committed = chain
+            .commit_block(block.clone())
+            .expect("consensus block should commit");
+
+        assert_eq!(committed.hash(), block.hash());
+        assert_eq!(chain.height(), 1);
+        assert_eq!(chain.block_count(), 2);
+
+        assert_eq!(
+            chain
+                .state()
+                .get_account(&alice_keypair.address())
+                .unwrap()
+                .balance,
+            969_000
+        );
+
+        assert_eq!(chain.state().get_account(&bob).unwrap().balance, 10_000);
+
+        assert_eq!(
+            chain.state().get_account(&fee_recipient).unwrap().balance,
+            21_000
+        );
+    }
+
+    #[test]
+    fn committed_external_block_rejects_invalid_transactions_root() {
+        let mut chain = create_chain();
+
+        let (_, bob, _) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
+
+        let tx = transaction(1, 0, &alice_keypair, bob, 10_000);
+
+        let mut working_state = chain.state().clone();
+
+        chain
+            .executor
+            .execute(&mut working_state, &tx)
+            .expect("transaction should execute");
+
+        let block = Block::new(
+            1,
+            1,
+            1_700_000_100,
+            chain.latest_block_hash(),
+            working_state.state_root(),
+            [9u8; 32],
+            vec![tx],
+        );
+
+        assert_eq!(
+            chain.commit_block(block),
+            Err(ChainError::InvalidTransactionsRoot)
+        );
+
+        assert_eq!(chain.height(), 0);
+    }
+
+    #[test]
+    fn committed_external_block_rejects_invalid_state_root() {
+        let mut chain = create_chain();
+
+        let (_, bob, _) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
+
+        let tx = transaction(1, 0, &alice_keypair, bob, 10_000);
+
+        let block = Block::new(
+            1,
+            1,
+            1_700_000_100,
+            chain.latest_block_hash(),
+            [9u8; 32],
+            tx.hash(),
+            vec![tx],
+        );
+
+        assert_eq!(chain.commit_block(block), Err(ChainError::InvalidStateRoot));
+
+        assert_eq!(chain.height(), 0);
+    }
+
+    #[test]
+    fn committed_external_block_rejects_wrong_previous_hash() {
+        let mut chain = create_chain();
+
+        let block = Block::new(
+            1,
+            1,
+            1_700_000_100,
+            [9u8; 32],
+            zero_hash(),
+            zero_hash(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            chain.commit_block(block),
+            Err(ChainError::InvalidPreviousHash)
+        );
+
+        assert_eq!(chain.height(), 0);
+    }
+
+    #[test]
+    fn committed_external_block_failure_does_not_modify_state() {
+        let mut chain = create_chain();
+
+        let (_, bob, _) = addresses();
+        let alice_keypair = Keypair::from_bytes(&[1u8; 32]);
+
+        let before_root = chain.state().state_root();
+        let before_height = chain.height();
+
+        let tx1 = transaction(1, 0, &alice_keypair, bob, 10_000);
+        let tx2 = transaction(1, 5, &alice_keypair, bob, 10_000);
+
+        /*
+         * The transaction root is valid for the supplied transactions,
+         * but execution of tx2 must fail because its nonce is wrong.
+         */
+        let block = Block::from_state(
+            1,
+            1,
+            1_700_000_100,
+            chain.latest_block_hash(),
+            &chain.state().clone(),
+            vec![tx1, tx2],
+        );
+
+        let result = chain.commit_block(block);
+
+        assert!(matches!(
+            result,
+            Err(ChainError::ExecutionFailed(ExecutionError::InvalidNonce))
+        ));
+
+        assert_eq!(chain.state().state_root(), before_root);
+        assert_eq!(chain.height(), before_height);
     }
 
     #[test]
