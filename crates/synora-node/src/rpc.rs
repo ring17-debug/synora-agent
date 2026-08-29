@@ -441,7 +441,7 @@ fn handle_connection(stream: &mut TcpStream, node: &mut SynoraNode) -> std::io::
                 .mempool()
                 .transactions()
                 .iter()
-                .map(|transaction| transaction_to_json(*transaction))
+                .map(|transaction| transaction_to_json(transaction))
                 .collect::<Vec<_>>();
 
             send_json_response(
@@ -779,7 +779,7 @@ fn decode_hex_field(value: &str, field: &str) -> Result<Vec<u8>, String> {
         return Ok(Vec::new());
     }
 
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(format!(
             "{field} must contain an even number of hexadecimal characters"
         ));

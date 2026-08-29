@@ -386,7 +386,7 @@ fn rpc_submit_transaction_then_mempool_contains_it() {
 
     assert_http_status(&mempool_response, "HTTP/1.1 200 OK");
     assert_json_contains(&mempool_response, "\"status\":\"ok\"");
-    assert_json_contains(&mempool_response, &format!("\"chain_id\":1337"));
+    assert_json_contains(&mempool_response, "\"chain_id\":1337");
     assert_json_contains(
         &mempool_response,
         &format!("\"sender\":\"{}\"", hex_encode(&transaction.sender)),

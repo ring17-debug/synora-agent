@@ -119,6 +119,7 @@ impl RpcClient {
     // Transaction submission
     // ------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_transaction(
         &self,
         chain_id: u64,
